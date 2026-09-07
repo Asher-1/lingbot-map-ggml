@@ -591,6 +591,18 @@ class SDPAAttention(Attention):
         self.kv_cache_cross_frame_special = kv_cache_cross_frame_special
         self.kv_cache_include_scale_frames = kv_cache_include_scale_frames
         self.kv_cache_camera_only = kv_cache_camera_only
+        # LINGBOT_KV_CACHE_F16 mirrors the C++ F16-cache contract. "1" (the
+        # release mode): cache entries are F16-rounded at append time while
+        # the current frame's K/V stay exact, matching the native path that
+        # uploads the cache as F16 and casts it back to F32 per layer.
+        # "flash": every K/V entering attention (cache and current) is
+        # F16-rounded, matching ggml_flash_attn_ext's F16 K/V inputs. Values
+        # are stored back as F32 either way so SDPA still accumulates in F32,
+        # making this the cache-precision-aware parity reference for the
+        # native F16 paths.
+        _f16_mode = os.environ.get("LINGBOT_KV_CACHE_F16")
+        self.kv_cache_f16 = _f16_mode is not None and _f16_mode != "0"
+        self.kv_cache_f16_flash = _f16_mode == "flash"
 
     def forward(self, x: Tensor, pos=None,
                 num_patches=None, num_special=None, num_frames=None, enable_3d_rope=False,
@@ -626,6 +638,22 @@ class SDPAAttention(Attention):
                 q = apply_rotary_emb(q, pos)
                 k = apply_rotary_emb(k, pos)
 
+            if self.kv_cache_f16 and self.kv_cache_f16_flash and kv_cache[f"k_{global_idx}"] is not None:
+                # flash mode, streaming frames: round K/V to F16 before the
+                # attention below, matching the native path's ggml_cast(F16)
+                # of both the current frame and the uploaded cache payload.
+                # The one-shot scale pass (empty cache) stays F32-exact like
+                # the native fallback path.
+                k = k.half().float()
+                v = v.half().float()
+                # E1c attribution probe: the ggml FA kernels convert Q to F16
+                # for their mma pipeline regardless of the input dtype, so a
+                # native F32 Q enters every attention row-rounded. Model that
+                # row-correlated rounding here (LINGBOT_Q_F16=1) to separate
+                # its contribution from the kernel's half2 VKQ accumulation.
+                if os.environ.get("LINGBOT_Q_F16"):
+                    q = q.half().float()
+
             camera_token_idx = 0
             scale_token_idx = camera_token_idx + num_register_tokens + 1
 
@@ -641,6 +669,15 @@ class SDPAAttention(Attention):
 
             if not skip_append:
                 # KEYFRAME: store in cache (original behavior)
+                if self.kv_cache_f16:
+                    # F16-cache modes: round at append so every later attention
+                    # reads the same F16-rounded values the native path uploads.
+                    # In flash mode this is idempotent for streaming frames
+                    # (already rounded above) and rounds the exact scale-pass
+                    # K/V; the current frame's own attention stays F32-exact
+                    # whenever the cache was empty.
+                    k_reshaped = k_reshaped.half().float()
+                    v_reshaped = v_reshaped.half().float()
                 if kv_cache[f"k_{global_idx}"] is None:
                     kv_cache[f"k_{global_idx}"] = k_reshaped
                     kv_cache[f"v_{global_idx}"] = v_reshaped
@@ -652,8 +689,11 @@ class SDPAAttention(Attention):
                     kv_cache, global_idx, camera_token_idx, scale_token_idx, num_register_tokens
                 )
 
-                k_cached = kv_cache[f"k_{global_idx}"].clone()
-                v_cached = kv_cache[f"v_{global_idx}"].clone()
+                # Read the cache directly: attention never mutates k/v, so the
+                # previous defensive clone doubled the cache footprint (2x
+                # transient per layer per frame) for no numerical effect.
+                k_cached = kv_cache[f"k_{global_idx}"]
+                v_cached = kv_cache[f"v_{global_idx}"]
             else:
                 # NON-KEYFRAME: attend to [cached + current] without storing in cache
                 if kv_cache[f"k_{global_idx}"] is not None:

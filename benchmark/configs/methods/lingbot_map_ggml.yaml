@@ -1,0 +1,12 @@
+model: lingbot_map_ggml
+_model: cpp_ggml/models/gguf/lingbot-map-q8.gguf
+_build: cpp_ggml/build-vulkan
+_backend: Vulkan0
+_kv_cache_scale_frames: 1
+_kv_cache_sliding_window: 4
+# The official 518x518 evaluation size uses the stored 37x37 DINO positional
+# table. Non-518 BSS profiles are now supported through the native host-side
+# DINO positional interpolation (validated at 392x392, see
+# cpp_ggml/benchmarks/validation_report.md).
+_area_budget: null
+_align: 14

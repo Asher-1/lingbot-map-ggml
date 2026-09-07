@@ -16,4 +16,14 @@ weights/
 .DS_Store
 **/.DS_Store
 docs/
-
+*.gguf
+*.pt
+*.onnx
+*.bin
+*.npz
+*.npy
+*.lbo
+*.ply
+*.glb
+cpp_ggml/build-*/
+cpp_ggml/.cache/

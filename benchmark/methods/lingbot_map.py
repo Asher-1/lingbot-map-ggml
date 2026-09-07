@@ -199,13 +199,18 @@ class LingbotMapMethod(BaseMethod):
         """
         from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
 
-        # Decode pose encoding to extrinsic + intrinsic
-        # pose_encoding_to_extri_intri() output is C2W directly (no inverse needed)
+        # Decode pose encoding to extrinsic + intrinsic. The decoder returns
+        # the camera-from-world [R|t]; the BSS pose contract (and demo.py's
+        # viewer) uses camera-to-world, so take the SE(3) inverse here.
         extrinsic, intrinsic = pose_encoding_to_extri_intri(
             predictions["pose_enc"], image_shape
         )
+        extrinsic_4x4 = np.tile(np.eye(4, dtype=extrinsic.dtype), (extrinsic.shape[1], 1, 1))
+        extrinsic_4x4[:, :3, :4] = extrinsic[0].cpu().numpy()
+        extrinsic = np.linalg.inv(extrinsic_4x4)[None]  # (1, S, 4, 4) c2w
+        extrinsic = torch.from_numpy(extrinsic).to(extrinsic.device)
 
-        extrinsic = extrinsic.float().cpu().numpy().squeeze(0)  # [S, 3, 4]
+        extrinsic = extrinsic.float().cpu().numpy().squeeze(0)  # [S, 4, 4] c2w
         intrinsic = intrinsic.float().cpu().numpy().squeeze(0)  # [S, 3, 3]
         depth = predictions["depth"].float().cpu().numpy().squeeze(0)  # [S, H, W, 1]
 

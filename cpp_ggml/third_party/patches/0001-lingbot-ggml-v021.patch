@@ -1,0 +1,653 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 11ed9e8b..030ab048 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,3 +1,7 @@
++# LingBot-Map applies source changes through cpp_ggml/third_party/patches.
++# This marker proves the CMake replay path against the pinned v0.21.0 source.
++set(LINGBOT_MAP_GGML_PATCHED_V021 ON)
++
+ cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
+ 
+ project("ggml" C CXX ASM)
+diff --git a/include/ggml.h b/include/ggml.h
+index 32462d79..6c8afa1e 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -2417,7 +2417,14 @@ extern "C" {
+     // k:    [n_embd_k, n_kv,    n_head_kv, ne3 ]
+     // v:    [n_embd_v, n_kv,    n_head_kv, ne3 ] !! not transposed !!
+     // mask: [n_kv,     n_batch, ne32,      ne33]
+-    // res:  [n_embd_v, n_head,  n_batch,   ne3 ] !! permuted !!
++    // res:  [n_embd_v, n_head,  n_batch,   ne3 ] !! already permuted !!
++    //
++    // res already carries the transposed layout: relative to q, the n_head
++    // and n_batch axes trade places. A caller that builds the head-major
++    // attention output by hand (mul_mat + ggml_permute(res, 0, 2, 1, 3))
++    // receives the same layout directly from this op and must NOT apply
++    // another permute(0, 2, 1, 3) on top of the result - a second permute
++    // scrambles heads and tokens.
+     //
+     // broadcast:
+     //   n_head % n_head_kv == 0
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index 14dd1098..4e86b645 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1501,7 +1501,7 @@ struct ggml_backend_cuda_context {
+         if (cublas_handles[device][curr_stream_no] == nullptr) {
+             ggml_cuda_set_device(device);
+             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
+-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
++            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_DEFAULT_MATH));
+             CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+             if (cublas_workspace_sizes[device] == 0) {
+diff --git a/src/ggml-cuda/fattn-mma-f16.cuh b/src/ggml-cuda/fattn-mma-f16.cuh
+index 7f4cfd55..5e06b373 100644
+--- a/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -864,24 +864,26 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+ 
+ #if defined(TURING_MMA_AVAILABLE)
+         if constexpr (cols_per_warp == 8) {
+-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
++            // F32 VKQ accumulator (lingbot patch): element (l%2) selects the
++            // thread's Q column, same mapping as the KQ max extraction.
+ #pragma unroll
+             for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+ #pragma unroll
+                 for (int l = 0; l < T_C_VKQ::ne; ++l) {
+-                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
++                    VKQ_C[i].x[l] *= KQ_max_scale[l % 2];
+                 }
+             }
+         } else {
++            // F32 VKQ accumulator (lingbot patch): each register element holds
++            // one Q column, thread's column index is (l/2) % 2 (same mapping
++            // as the KQ max extraction above). The half2 variant applied the
++            // scale at half precision, compounding ~5e-4 relative rounding
++            // over every running-max increase (one per KV tile).
+ #pragma unroll
+-            for (int col = 0; col < cols_per_thread; ++col) {
+-                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+-#pragma unroll
+-                for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
++            for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
+ #pragma unroll
+-                    for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
+-                        VKQ_C[i].x[l0 + col] *= KQ_max_scale_h2;
+-                    }
++                for (int l = 0; l < T_C_VKQ::ne; ++l) {
++                    VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % 2];
+                 }
+             }
+         }
+@@ -921,14 +923,41 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+     // Convert KQ C tiles into B tiles for VKQ calculation:
+     T_B_VKQ B[nbatch_fa/(np*2*T_B_VKQ::J)];
+     static_assert(nbatch_fa % (np*2*T_B_VKQ::J) == 0, "bad loop size");
++    // lingbot patch: split the softmax weights P into F16 high + low halves so
++    // the PV tensor-core product keeps ~F32-effective weight precision. The
++    // single-F16 P rounding was the largest post-softmax noise component and
++    // is strongly amplified by this model's KV-cache feedback loop.
++#if defined(TURING_MMA_AVAILABLE)
++    T_B_VKQ B_lo[nbatch_fa/(np*2*T_B_VKQ::J)];
++#endif // defined(TURING_MMA_AVAILABLE)
+     if constexpr (cols_per_warp == 8) {
+ #pragma unroll
+         for (int k = 0; k < nbatch_fa/(np*2*T_B_VKQ::J); ++k) {
++#if defined(TURING_MMA_AVAILABLE)
++            const tile<16, 4, half2> hi = get_half2(KQ_C[k]);
++            B[k] = get_transposed(hi);
++            tile<16, 4, half2> lo;
++#pragma unroll
++            for (int l = 0; l < hi.ne; ++l) {
++                lo.x[l] = make_half2(KQ_C[k].x[2*l] - __low2float(hi.x[l]),
++                                     KQ_C[k].x[2*l + 1] - __high2float(hi.x[l]));
++            }
++            B_lo[k] = get_transposed(lo);
++#else
+             B[k] = get_transposed(get_half2(KQ_C[k]));
++#endif // defined(TURING_MMA_AVAILABLE)
+         }
+     } else {
+         for (int k = 0; k < nbatch_fa/(np*2*T_B_VKQ::J); ++k) {
++#if defined(TURING_MMA_AVAILABLE)
+             B[k] = get_half2(KQ_C[k]);
++            for (int l = 0; l < T_B_VKQ::ne; ++l) {
++                B_lo[k].x[l] = make_half2(KQ_C[k].x[2*l] - __low2float(B[k].x[l]),
++                                          KQ_C[k].x[2*l + 1] - __high2float(B[k].x[l]));
++            }
++#else
++            B[k] = get_half2(KQ_C[k]);
++#endif // defined(TURING_MMA_AVAILABLE)
+         }
+     }
+ 
+@@ -981,6 +1010,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+                 load_ldmatrix_trans(A, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
+                 if constexpr (T_B_KQ::I == 8) {
+                     mma(VKQ_C[i_VKQ_0/T_A_VKQ::I], A, B[k00/(np*T_A_VKQ::J)]);
++#if defined(TURING_MMA_AVAILABLE)
++                    mma(VKQ_C[i_VKQ_0/T_A_VKQ::I], A, B_lo[k00/(np*T_A_VKQ::J)]);
++#endif // defined(TURING_MMA_AVAILABLE)
+                 } else {
+                     // Wide version of VKQ_C is column-major.
+ #if defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+@@ -989,6 +1021,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+ #else
+                     // swap A and B for CUDA.
+                     mma(VKQ_C[i_VKQ_0/T_A_VKQ::I], B[k00/(np*T_A_VKQ::J)], A);
++#if defined(TURING_MMA_AVAILABLE)
++                    mma(VKQ_C[i_VKQ_0/T_A_VKQ::I], B_lo[k00/(np*T_A_VKQ::J)], A);
++#endif // defined(TURING_MMA_AVAILABLE)
+ #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+                 }
+             }
+@@ -1031,7 +1066,12 @@ template<int DV, int ncols> struct mma_tile_sizes {
+     using T_C_KQ  = tile<16, 16, float>; // column-major
+     using T_A_VKQ = tile<16,  8, half2>; // row-major
+     using T_B_VKQ = tile<16,  8, half2>; // column-major
+-    using T_C_VKQ = tile<16,  8, half2>; // column-major
++    // F32 VKQ accumulation (lingbot patch): the mma.f32.f16.f16.f32 pipeline
++    // keeps the PV product in F32 registers instead of half2, removing the
++    // per-tile half-precision accumulator rounding (and the half-precision
++    // running-max rescale) that compounds over the KV axis and diverges
++    // long-stream parity. Same C fragment layout as T_C_KQ.
++    using T_C_VKQ = tile<16, 16, float>; // column-major
+ };
+ template<int DV> struct mma_tile_sizes<DV, 8> {
+     using T_A_KQ  = tile<16,  8, half2>; // row-major
+@@ -1039,7 +1079,9 @@ template<int DV> struct mma_tile_sizes<DV, 8> {
+     using T_C_KQ  = tile<16,  8, float>; // row-major
+     using T_A_VKQ = tile<16,  8, half2>; // row-major
+     using T_B_VKQ = tile< 8,  8, half2>; // column-major
+-    using T_C_VKQ = tile<16,  4, half2>; // row-major
++    // F32 VKQ accumulation (lingbot patch), same rationale as the wide
++    // specialization above; this shape serves the 1-token camera-head calls.
++    using T_C_VKQ = tile<16,  8, float>; // row-major
+ };
+ #elif defined(AMD_WMMA_AVAILABLE)
+ #ifdef RDNA3
+@@ -1180,7 +1222,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+ 
+     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
+ #if defined(TURING_MMA_AVAILABLE)
+-    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
++    // F32 VKQ tiles store one DV row per J element (no half2 packing),
++    // hence DV/T_C_VKQ::J tiles; the half2 narrow path keeps its packed count.
++    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/T_C_VKQ::J];
+ #elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+     T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
+ #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+@@ -1369,24 +1413,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+ 
+ #if defined(TURING_MMA_AVAILABLE)
+         if constexpr (cols_per_warp == 8) {
+-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
++            // F32 VKQ accumulator (lingbot patch), same column mapping as the
++            // streaming rescale above.
+ #pragma unroll
+             for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+ #pragma unroll
+                 for (int l = 0; l < T_C_VKQ::ne; ++l) {
+-                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
++                    VKQ_C[i].x[l] *= KQ_max_scale[l % 2];
+                 }
+             }
+         } else {
++            // F32 VKQ accumulator (lingbot patch), same column mapping as the
++            // streaming rescale above.
+ #pragma unroll
+-            for (int col = 0; col < cols_per_thread; ++col) {
+-                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+-#pragma unroll
+-                for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
++            for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
+ #pragma unroll
+-                    for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
+-                        VKQ_C[i].x[l0 + col] *= KQ_max_scale_h2;
+-                    }
++                for (int l = 0; l < T_C_VKQ::ne; ++l) {
++                    VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % 2];
+                 }
+             }
+         }
+@@ -1431,11 +1474,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+     static_assert((DV/2) % nbatch_combine == 0, "bad nbatch_combine");
+ 
+     if constexpr (cols_per_warp == 8) {
+-        const int jc_cwmo = (threadIdx.x % (2*T_C_VKQ::J)) / T_C_VKQ::J; // jc combine write meta offset
+-        const int jc_cwm = threadIdx.y*(2*T_C_VKQ::J) + 2*T_C_VKQ::get_j(-1) + jc_cwmo; // jc combine write meta
++        // F32 VKQ tiles (lingbot patch): each thread holds Q columns
++        // (threadIdx.x%4)*2 and +1; the warp's 8 columns are covered by the
++        // 8 writer threads with KQ_max index (threadIdx.x%8)/4.
++        const int jc_cwmo = (threadIdx.x % 8) / 4; // jc combine write meta offset
++        const int jc_cwm = threadIdx.y*T_C_VKQ::J + (threadIdx.x % 4)*2 + jc_cwmo; // jc combine write meta
+         const float2 KQ_cmr = make_float2(KQ_max[jc_cwmo], KQ_rowsum[jc_cwmo]); // KQ combine max rowsum
+ 
+-        if (((!needs_fixup && !is_fixup) || np > 1) && threadIdx.x < 2*T_C_VKQ::J) {
++        if (((!needs_fixup && !is_fixup) || np > 1) && threadIdx.x < T_C_VKQ::J) {
+             // Use the 16 bytes of padding in each row to store the meta data: KQ max, KQ rowsum, KQ max scale.
+             ((float2 *) tile_Q)[jc_cwm*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
+         }
+@@ -1458,9 +1504,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+         // KQ_cmr = KQ combine max rowsum
+         // Use the 16 bytes of padding in each Q column to store the meta data: KQ max, KQ rowsum, KQ max scale.
+ #if defined(TURING_MMA_AVAILABLE)
++        // F32 VKQ tiles (lingbot patch): the thread's two Q columns are
++        // T_C_VKQ::get_i(0) and T_C_VKQ::get_i(2) (tid/4 and 8 + tid/4),
++        // selected by the even thread indices; the KQ_max/KQ_rowsum entry
++        // for a column is its (threadIdx.x % 4)/2 index. The old half2 tile
++        // mapped column groups with l%2, which does not transfer to the
++        // unpacked float layout.
+         const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
+-        const float2 KQ_cmr = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
+-        const bool thread_should_write = threadIdx.x % 4 < cols_per_thread;
++        const float2 KQ_cmr = make_float2(KQ_max[(threadIdx.x % 4) / 2], KQ_rowsum[(threadIdx.x % 4) / 2]);
++        const bool thread_should_write = threadIdx.x % 2 == 0;
+ #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+         const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(0);
+         const float2 KQ_cmr = make_float2(KQ_max[0], KQ_rowsum[0]);
+@@ -1563,14 +1615,52 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+         __syncthreads();
+     }
+ 
++#if defined(TURING_MMA_AVAILABLE)
++    // lingbot patch: with one warp group per Q column block (np == 1) and F32
++    // VKQ accumulators, the result can go straight from registers to the F32
++    // destination. The default path detours through shared memory, which
++    // stores half values and rounds the finished attention output; that
++    // rounding is amplified by this model's KV-cache feedback loop.
++    if constexpr (np == 1 && std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>) {
++        const int j0 = threadIdx.y*cols_per_warp;
++#pragma unroll
++        for (int t = 0; t < DV/T_C_VKQ::J; ++t) {
++#pragma unroll
++            for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
++                const int jc_dst = j0 + T_C_VKQ::get_i(l0); // block-local Q column
++                const int j_dst = jc_dst / ncols2;
++                const int c_dst = jc_dst % ncols2;
++                if (jt*ncols1 + j_dst >= int(ne01.z) || zt_gqa*ncols2 + c_dst >= gqa_ratio) {
++                    continue;
++                }
++                const int col = (l0/2) % 2; // this thread's KQ_max/KQ_rowsum index for the column
++                const int k = t*(T_C_VKQ::J/2) + (threadIdx.x % 4) + 4*(l0/4); // d/2 as a float2 row index
++                float2 val = make_float2(VKQ_C[t].x[l0], VKQ_C[t].x[l0 + 1]);
++                if (!needs_fixup && !is_fixup) {
++                    val.x /= KQ_rowsum[col];
++                    val.y /= KQ_rowsum[col];
++                    dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k] = val;
++                } else if (needs_fixup) {
++                    dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k] = val;
++                } else {
++                    float2 * dstk_fixup_data = dstk_fixup + gridDim.x*(2*ncols) + blockIdx.x*(ncols*(DV/2));
++                    dstk_fixup_data[jc_dst*(DV/2) + k] = val;
++                }
++            }
++        }
++    } else
++#endif // defined(TURING_MMA_AVAILABLE)
++    {
+ #pragma unroll
+     for (int k00 = 0; k00 < DV/2; k00 += nbatch_combine) {
+         if constexpr (cols_per_warp == 8) {
+-            static_assert(std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>, "bad VKQ type");
++            static_assert(std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>, "bad VKQ type");
+             const int jc_cwd = threadIdx.y*T_B_KQ::I + T_B_KQ::get_i(-1); // jc combine write data
+ #pragma unroll
+             for (int k1 = 0; k1 < nbatch_combine; k1 += T_B_KQ::J) {
+-                const T_B_KQ B = get_transposed(VKQ_C[(k00 + k1)/T_B_KQ::J]); // Conversion of C to B matrix puts it in column-major format.
++                // F32 accumulator (lingbot patch): round to the F16 shared-memory
++                // layout through the same helper chain as the half2 variant.
++                const T_B_KQ B = get_transposed(get_half2(VKQ_C[(k00 + k1)/T_B_KQ::J])); // Conversion of C to B matrix puts it in column-major format.
+ 
+ #pragma unroll
+                 for (int l = 0; l < T_B_KQ::ne; ++l) {
+@@ -1691,6 +1781,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+             __syncthreads();
+         }
+     }
++    } // lingbot patch: np == 1 direct-write alternative
+ #else
+     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dstk_fixup,
+         scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index f6cbaecb..268da619 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -6054,14 +6054,24 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         CREATE_CONV(conv2d, _f16_f32, spv_suffix) \
+         CREATE_CONV(conv_transpose_2d, _f32, spv_suffix) \
+         CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix)
++#define CREATE_F16_CONVS(spv_suffix) \
++        CREATE_CONV(conv2d, _f16_f32, spv_suffix) \
++        CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix)
+ #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+         if (device->coopmat2) {
+-            CREATE_CONVS(_cm2)
++            CREATE_F16_CONVS(_cm2)
++            // lingbot patch: coopmat2 only ships the _f16_f32 conv variants,
++            // but GCT's DPT heads feed F32 weights and an F32 dst to conv2d
++            // and conv_transpose_2d; without the scalar F32 pipelines the
++            // type-based lookup returns an empty pipeline and the first
++            // dispatch dies with SIGFPE (integer divide by zero).
++            CREATE_CONVS( )
+         } else
+ #endif
+ #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+         if (conv2d_use_cm1) {
+-            CREATE_CONVS(_cm1)
++            CREATE_F16_CONVS(_cm1)
++            CREATE_CONVS( )
+         } else
+ #endif
+         if (conv2d_UNROLL) {
+@@ -6071,6 +6081,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         }
+ #undef CREATE_CONV
+ #undef CREATE_CONVS
++#undef CREATE_F16_CONVS
+ 
+         std::vector<uint32_t> conv3d_spec_constants = { conv2d_WG_SIZE, conv2d_BS.K, conv2d_BS.CRS, conv2d_BS.NPQ, conv2d_TS_K, conv2d_SHMEM_PAD };
+ #define CREATE_CONV3D(type_suffix, spv_suffix) \
+@@ -7085,6 +7096,20 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             device->mmvq_mode = 1;
+         }
+ 
++#if defined(VK_KHR_cooperative_matrix) || defined(VK_NV_cooperative_matrix2)
++        // lingbot patch: keep the general matmul pipelines on the scalar F32
++        // path (the coopmat matmuls round the activations to F16, which this
++        // model's streaming cache amplifies) while still allowing the
++        // flash-attention dispatch to use cooperative matrices — the NV
++        // coopmat2 FA computes PV with F32 weights and F32 V.
++        if (getenv("GGML_VK_FA_COOPMAT_ONLY")) {
++            device->coopmat_support = false;
++            device->coopmat_acc_f32_support = false;
++            device->coopmat_acc_f16_support = false;
++            device->fp16 = false;
++        }
++#endif
++
+         return device;
+     }
+ 
+@@ -9216,7 +9241,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+ 
+     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
+ 
+-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
++    // GGML_PREC_F32 is a graph-level arithmetic contract.  Do not silently
++    // quantize its activation operand to Q8_1 before selecting the Vulkan
++    // matmul pipeline: recurrent vision-transformer blocks compound that
++    // error across layers and streaming cache updates.
++    const bool force_f32_activations = (ggml_prec) dst->op_params[0] == GGML_PREC_F32;
++    bool quantize_y = !force_f32_activations && ctx->device->integer_dot_product &&
++        src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+ 
+     // Check for mmq first
+     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
+@@ -10668,7 +10699,6 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
+ }
+ 
+ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
+-    GGML_UNUSED(f32acc);
+     // Needs to be kept up to date on shader changes
+     const uint32_t wg_size = params.workgroup_size;
+     const uint32_t Br = params.block_rows;
+@@ -10681,7 +10711,10 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
+ 
+     // tmpsh is overestimated slightly
+     const uint32_t tmpsh = wg_size * sizeof(float);
+-    const uint32_t tmpshv4 = wg_size * 4 * float_type_size;
++    // lingbot patch: FA_F32ACC variants run the output chain (including the
++    // tmpshv4 reduction staging) in F32, so their staging element is a vec4.
++    const uint32_t o_type_size = (f32acc || !device->fp16 || k_type == GGML_TYPE_BF16) ? sizeof(float) : sizeof(ggml_fp16_t);
++    const uint32_t tmpshv4 = wg_size * 4 * o_type_size;
+ 
+     const uint32_t masksh = Bc * (Br + 1) * float_type_size;
+     // DATA_A_IQ4_NL is compiled into the FA shaders unconditionally, so its shared table is always allocated.
+@@ -10743,6 +10776,9 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
+ 
+     const uint32_t psh_stride = Br / 4 + 2;
+     const uint32_t Psh = Bc * psh_stride * f16vec4;
++    // lingbot patch: the f32acc FA variants stage a second F16 P tile for the
++    // hi/lo split (P = P_hi + P_lo), doubling the P shared memory.
++    const uint32_t Psh_lo = f32acc ? Psh : 0;
+ 
+     const uint32_t sfshstride = (hsk <= 128) ? (Br + 8) : Br;
+     const uint32_t sfsh = Bc * sfshstride * acctype;
+@@ -10752,13 +10788,15 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
+     const uint32_t ksh = ((kvshstride >= vsh_stride) ? (Bc * kvshstride) : (Bc * vsh_stride)) * f16vec4;
+ 
+     // BF16 PVMat accumulator is f32 (no bf16 accumulator support), so pvsh is vec4 (16 bytes)
+-    const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16) ? 16u : f16vec4;
++    // lingbot patch: FA_F32ACC variants also accumulate PV in F32 (O_TYPE =
++    // float), so their pvsh staging is vec4-sized as well.
++    const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16 || f32acc) ? 16u : f16vec4;
+     const uint32_t osh_stride = params.row_split * MatBr / 4;
+     const uint32_t pvsh = MatBc * osh_stride * pvsh_elem_size;
+ 
+     const uint32_t slope = Br * acctype;
+ 
+-    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope;
++    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + Psh_lo + sfsh + ksh + pvsh + slope;
+     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
+ 
+     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
+diff --git a/src/ggml-vulkan/vulkan-shaders/flash_attn.comp b/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
+index 0c1b6d06..26d382f2 100644
+--- a/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
++++ b/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
+@@ -45,7 +45,7 @@ layout (binding = 3) readonly buffer M {float16_t data_m[];};
+ // If SubGroupSize is set to 0 then only use shmem reductions
+ const uint32_t tmpsh_size = (SubGroupSize > 0) ? (row_split == 1 ? num_subgroups * D_split : num_subgroups) : WorkGroupSize;
+ shared float tmpsh[tmpsh_size];
+-shared FLOAT_TYPEV4 tmpshv4[tmpsh_size];
++shared O_TYPEV4 tmpshv4[tmpsh_size];
+ 
+ const uint32_t masksh_stride = Br + 1;
+ shared FLOAT_TYPE masksh[Bc * masksh_stride];
+@@ -150,10 +150,10 @@ void main() {
+     }
+     barrier();
+ 
+-    FLOAT_TYPEV4 Of[rows_per_thread][HSV_per_thread / 4];
++    O_TYPEV4 Of[rows_per_thread][HSV_per_thread / 4];
+     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+-            Of[r][d] = FLOAT_TYPEV4(0.0);
++            Of[r][d] = O_TYPEV4(0.0);
+         }
+     }
+ 
+@@ -478,7 +478,7 @@ void main() {
+ 
+         [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+-                Of[r][d] = FLOAT_TYPE(eMf[r]) * Of[r][d];
++                Of[r][d] = O_TYPE(eMf[r]) * Of[r][d];
+             }
+         }
+ 
+@@ -613,7 +613,7 @@ void main() {
+         }
+ 
+         [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+-            Of[r][d] = FLOAT_TYPE(eMf) * Of[r][d];
++            Of[r][d] = O_TYPE(eMf) * Of[r][d];
+ 
+             if (SubGroupSize > 0) {
+                 [[unroll]] for (uint s = D_split; s < SubGroupSize; s *= 2) {
+@@ -731,7 +731,7 @@ void main() {
+         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+             Of[r][d] *= FLOAT_TYPE(Lfrcp[r]);
+ #if defined(FLOAT_TYPE_MAX)
+-            Of[r][d] = clamp(Of[r][d], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
++            Of[r][d] = clamp(Of[r][d], O_TYPE(-FLOAT_TYPE_MAX), O_TYPE(FLOAT_TYPE_MAX));
+ #endif
+         }
+     }
+diff --git a/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl b/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
+index 3c64f91d..c7768322 100644
+--- a/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
++++ b/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
+@@ -100,13 +100,18 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
+ #define FA_TYPE_IQ4_NL 20u
+ #define FA_TYPE_BF16 30u
+ 
+-#if defined(BFLOAT16)
++#if defined(BFLOAT16) || defined(FA_F32ACC)
+ #define O_TYPE float
+ #define O_TYPEV4 vec4
+ #else
+ #define O_TYPE FLOAT_TYPE
+ #define O_TYPEV4 FLOAT_TYPEV4
+ #endif
++// lingbot patch: the F32-accumulator FA variants now also accumulate and
++// stage the PV product in F32 (O_TYPE). With O_TYPE = F16 the per-tile PV
++// accumulation, its shared-memory staging and the running-max rescale all
++// rounded at F16 precision — the same compounding error class as the CUDA
++// half2 VKQ accumulator that this project already replaced.
+ 
+ // Number of matrix elements per buffer block, derived from the K/V type spec
+ // constant. F32 is treated as a vec4 "block" of 4 floats. F16 uses block size 1
+diff --git a/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+index 057ed739..2693f2e3 100644
+--- a/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
++++ b/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+@@ -46,6 +46,10 @@ shared FLOAT_TYPEV4 Qf[Br * qstride];
+ 
+ const uint psh_stride = Br / 4 + 2;
+ shared FLOAT_TYPEV4 Psh[Bc * psh_stride];
++#ifdef FA_F32ACC
++// lingbot patch: low half of the softmax-weight hi/lo split (see below).
++shared FLOAT_TYPEV4 Psh_lo[Bc * psh_stride];
++#endif
+ 
+ // Avoid padding for hsk==256 to make it fit in 48KB shmem.
+ const uint32_t sfshstride = (HSK <= 128) ? (Br / 4 + 2) : Br / 4;
+@@ -384,13 +388,35 @@ void main() {
+                 const uint row = tile_row(r);
+                 if (KV_bounds_check && j * Bc + col >= KV) {
+                     Psh[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
++#ifdef FA_F32ACC
++                    Psh_lo[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
++#endif
+                 } else {
+                     const vec4 mfvec = vec4(Mf[r], Mf[r + 1], Mf[r + 2], Mf[r + 3]);
+-                    const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
++                    const vec4 ex = exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec);
++                    const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(ex);
+                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
++#ifdef FA_F32ACC
++                        // f32 rowsum, matching the CUDA hi/lo patch: the f16
++                        // rounding of each term would feed the normalization
++                        // divisor, a post-softmax error the streaming cache
++                        // amplifies.
++                        Lf[r + vec_idx] += ex[vec_idx];
++#else
+                         Lf[r + vec_idx] += Pf[vec_idx];
++#endif
+                     }
+                     Psh[col * psh_stride + row / 4] = Pf;
++#ifdef FA_F32ACC
++                    // Split P into F16 high + low halves: P = hi + lo with
++                    // |lo| <= 2^-11 |p|, so the pair carries ~22 mantissa
++                    // bits through the F16-input coopmat multiply. The
++                    // single-F16 rounding is the dominant post-softmax noise
++                    // and this model's KV-cache feedback loop amplifies it
++                    // (286-frame pose 2.5e-03 without the split, see
++                    // validation_report.md "Vulkan speed optimization").
++                    Psh_lo[col * psh_stride + row / 4] = FLOAT_TYPEV4(ex - vec4(Pf));
++#endif
+                 }
+             }
+         }
+@@ -494,6 +520,12 @@ void main() {
+                     }
+ 
+                     PVMat = coopMatMulAdd(KMat, QMat, PVMat);
++#ifdef FA_F32ACC
++                    // Second multiply with the low half, accumulated into
++                    // the same F32 PVMat (P = P_hi + P_lo to ~22 bits).
++                    coopMatLoad(KMat, Psh_lo, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
++                    PVMat = coopMatMulAdd(KMat, QMat, PVMat);
++#endif
+                 }
+ 
+                 // Store PVMat to pvsh and load into Of
+@@ -614,7 +646,7 @@ void main() {
+         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+             Of[r][d_local] *= O_TYPE(Lfrcp[r]);
+ #if defined(FLOAT_TYPE_MAX)
+-            Of[r][d_local] = clamp(Of[r][d_local], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
++            Of[r][d_local] = clamp(Of[r][d_local], O_TYPE(-FLOAT_TYPE_MAX), O_TYPE(FLOAT_TYPE_MAX));
+ #endif
+         }
+     }
+diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index caa0c889..8f389fd6 100644
+--- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -678,6 +678,12 @@ void process_shaders() {
+             fa_base_dict["DATA_A_IQ4_NL"] = "1";
+             if (fp16 && f16acc) {
+                 fa_base_dict["ACC_TYPE_MAX"] = "float16_t(65504.0)";
++            } else {
++                // lingbot patch: mark the F32-accumulator FA variants so the
++                // shaders can enable the P hi/lo split. The f16-input coopmat
++                // otherwise rounds the softmax weights to F16, which this
++                // model's KV-cache feedback loop amplifies into the pose.
++                fa_base_dict["FA_F32ACC"] = "1";
+             }
+ 
+             if (fp16) {
+@@ -1089,14 +1095,16 @@ void process_shaders() {
+                     + (a_f16 ? "_f16" : "") + "_f32";
+                 string_to_spv(name + (unroll ? "_unroll" : ""), "conv2d_mm.comp", defines);
+ #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+-                if (unroll) {
++                // conv2d_mm uses float16 cooperative-matrix accumulators.
++                // Do not select it for an explicit f32-weight convolution.
++                if (unroll && a_f16) {
+                     auto cm2_defines = defines;
+                     cm2_defines["COOPMAT2"] = "1";
+                     string_to_spv(name, "conv2d_mm.comp", cm2_defines, true, false, true);
+                 }
+ #endif
+ #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+-                if (unroll) {
++                if (unroll && a_f16) {
+                     auto cm1_defines = defines;
+                     cm1_defines["COOPMAT"] = "1";
+                     string_to_spv(name, "conv2d_mm.comp", cm1_defines, true, true, false);
+diff --git a/src/ggml.c b/src/ggml.c
+index 1a60fec7..6813b027 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -4681,7 +4681,8 @@ struct ggml_tensor * ggml_conv_2d(
+         int                   p1,
+         int                   d0,
+         int                   d1) {
+-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16); // [N, OH, OW, IC * KH * KW]
++    const enum ggml_type im2col_type = (a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_BF16) ? GGML_TYPE_F32 : GGML_TYPE_F16;
++    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, im2col_type); // [N, OH, OW, IC * KH * KW]
+ 
+     struct ggml_tensor * result =
+         ggml_mul_mat(ctx,
+@@ -5443,7 +5444,12 @@ struct ggml_tensor * ggml_flash_attn_ext(
+         GGML_ASSERT(mask);
+     }
+ 
+-    // permute(0, 2, 1, 3)
++    // The result layout is already the head-major permutation of the inputs:
++    // relative to q ([n_embd, n_batch, n_head] reading), the n_head and
++    // n_batch axes trade places, i.e. res = permute(0, 2, 1, 3) of the
++    // batch-major form. Consumers that build the head-major output by hand
++    // (mul_mat + permute(0, 2, 1, 3)) get the same layout here directly and
++    // must not permute the result again.
+     int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+ 

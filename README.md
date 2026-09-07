@@ -37,19 +37,39 @@ LingBot-Map has focused on:
 <details>
 <summary>Click to expand</summary>
 
+- [📑 Table of Contents](#-table-of-contents)
 - [📰 News](#-news)
 - [📋 TODO](#-todo)
 - [⚙️ Installation](#️-installation)
 - [📦 Model Download](#-model-download)
 - [🚀 Quick Start](#-quick-start)
+  - [From Clone to End-to-End](#from-clone-to-end-to-end)
+  - [C++ GGML runtime](#c-ggml-runtime)
+    - [GGML deployment: CUDA and Vulkan](#ggml-deployment-cuda-and-vulkan)
+    - [GGML GUI reconstruction (one command)](#ggml-gui-reconstruction-one-command)
 - [🎬 Interactive Demo (`demo.py`)](#-interactive-demo-demopy)
   - [Try the Example Scenes](#try-the-example-scenes)
+    - [🎯 Featured: indoor walkthrough (~25 000 frames, 13 minutes)](#-featured-indoor-walkthrough-25-000-frames-13-minutes)
+  - [Dynamic Demo (From Droid-W)](#dynamic-demo-from-droid-w)
   - [Streaming with Keyframe Interval](#streaming-with-keyframe-interval)
-  - [Windowed Inference (for long sequences, >3000 frames)](#windowed-inference-for-long-sequences-3000-frames)
+  - [Windowed Inference (for long sequences, \>3000 frames)](#windowed-inference-for-long-sequences-3000-frames)
   - [Sky Masking](#sky-masking)
   - [Visualization Options](#visualization-options)
-  - [Performance & Memory](#performance--memory)
+  - [Performance \& Memory](#performance--memory)
+    - [Without FlashInfer (SDPA fallback)](#without-flashinfer-sdpa-fallback)
+    - [Running on Limited GPU Memory](#running-on-limited-gpu-memory)
+    - [Faster Inference](#faster-inference)
 - [🎥 Offline Rendering Pipeline (`demo_render/batch_demo.py`)](#-offline-rendering-pipeline-demo_renderbatch_demopy)
+  - [Install (extends the main install)](#install-extends-the-main-install)
+  - [Worked Example — long indoor walkthrough (~25 000 frames, 13 minutes)](#worked-example--long-indoor-walkthrough-25-000-frames-13-minutes)
+    - [Quick Mode and Demo Reproduction](#quick-mode-and-demo-reproduction)
+  - [Worked Example — outdoor drive scene](#worked-example--outdoor-drive-scene)
+  - [Worked Example — LingBot-World scenes](#worked-example--lingbot-world-scenes)
+  - [Camera Path (YAML)](#camera-path-yaml)
+    - [YAML structure](#yaml-structure)
+    - [Available modes](#available-modes)
+    - [Single-shot YAML examples](#single-shot-yaml-examples)
+  - [Output files](#output-files)
 - [📜 License](#-license)
 - [📖 Citation](#-citation)
 - [✨ Acknowledgments](#-acknowledgments)
@@ -141,6 +161,161 @@ pip install -e ".[vis]"
 
 ## 🚀 Quick Start
 
+### From Clone to End-to-End
+
+The complete path from a fresh machine to a running reconstruction and a
+validated end-to-end gate:
+
+```bash
+# 1. Clone with the pinned ggml submodule (required by the C++ runtime)
+git clone --recursive https://github.com/<you>/lingbot-map-ggml.git
+cd lingbot-map-ggml
+git submodule update --init --recursive   # if cloned without --recursive
+
+# 2a. Python environment — official PyTorch engine (also runs the GGML GUI)
+conda create -n lingbot-map python=3.10 -y && conda activate lingbot-map
+pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+pip install -e ".[vis]" && pip install --index-url https://pypi.org/simple flashinfer-python
+
+# 2b. ...or a minimal viewer-only env for the GGML engine (no torch needed)
+#     any python with:  pip install viser trimesh numpy pillow
+
+# 3. Weights — download at least one of:
+huggingface-cli download robbyant/lingbot-map \
+  lingbot-map.pt --local-dir cpp_ggml/models/pytorch          # official checkpoint (PyTorch engine)
+huggingface-cli download Asher-1/lingbot-map-gguf \
+  lingbot-map-q8.gguf lingbot-map-f16.gguf --local-dir cpp_ggml/models/gguf  # GGML engine
+# (f32/f16 GGUFs can also be converted locally from the .pt:
+#  python cpp_ggml/scripts/convert_lingbot.py cpp_ggml/models/pytorch/lingbot-map.pt \
+#    cpp_ggml/models/gguf/lingbot-map-f32.gguf --outtype f32)
+
+# 4. One-command GUI (auto-picks the engine per what this machine has)
+bash run_gui.sh
+#    -> http://localhost:8080
+#    --engine ggml|pytorch forces one; --frames N for a quick look
+
+# 5. Headless end-to-end validation (builds + runs the 286-frame parity gate)
+bash cpp_ggml/scripts/run_e2e.sh cuda q8      # or: vulkan f16
+#    -> PASS lines + CSV/PNG/PLY evidence in cpp_ggml/benchmarks/
+```
+
+Notes:
+- The GGML engine needs **no torch**: the GUI only requires `viser`, `numpy`
+  and `pillow` in whatever interpreter it finds (project venv, system python,
+  any conda env; `viser trimesh` are auto-installed when missing).
+- GPU memory at the default `scale=8/window=64` profile: q8 ≈ 21 GiB,
+  f16 ≈ 22.4 GiB at 518×294; 12 GiB cards should use the bounded
+  `scale=1/window=4` profile (`--kv_cache_scale 1 --kv_cache_window 4`) or
+  the run_e2e f16/Vulkan path.
+- Accuracy vs the official PyTorch pipeline: f16 GGUF is the full-alignment
+  format (pose 1.72e-04 / depth 4.72e-04 over 286 frames); q8 trades part of
+  that margin for half the memory. Details in
+  [`cpp_ggml/benchmarks/validation_report.md`](cpp_ggml/benchmarks/validation_report.md).
+
+### C++ GGML runtime
+
+The repository includes a pinned GGML v0.21.0 integration under
+[`cpp_ggml/`](cpp_ggml/README.md). It provides CMake patch replay, checkpoint
+conversion to GGUF, CPU/CUDA/Vulkan backend selection, and measurement scripts.
+
+#### GGML deployment: CUDA and Vulkan
+
+Download q8 or f16 GGUF deployment models from
+[Asher-1/lingbot-map-gguf](https://huggingface.co/Asher-1/lingbot-map-gguf/tree/main)
+into `cpp_ggml/models/gguf/`. The C++ graph runs DINO/GCT streaming attention,
+RoPE, persistent global/camera caches, CameraCausalHead, and four-scale DPT
+depth reconstruction without cuDNN. On the official 286-frame `courthouse`
+sequence at the native aspect (518×294, the identity output of the official
+crop rule for these frames) with the upstream `scale=8/window=64` profile and
+the persistent F16 KV cache, q8 CUDA has strict GGUF-reference parity
+(pose RMSE 6.14e-05, depth RMSE 9.75e-05; zero pose violations, ≤0.010%
+depth violations at discontinuities). Vulkan q8 reaches 3.89e-05 / 9.71e-05
+at the same profile. These runs use the full C++ postprocess path, no cuDNN,
+and the same cache profile as the official PyTorch pipeline. Run the
+reproducible command below rather than reusing cached plots:
+
+```bash
+bash cpp_ggml/scripts/run_e2e.sh cuda q8
+```
+
+**End-to-end alignment with the official PyTorch pipeline**: preprocessing
+is bit-identical (`max_abs_diff=0`), and against the official fp32/bf16
+checkpoint the f16 GGUF deviates by pose `1.72e-04` / depth `4.72e-04` over
+the full 286-frame stream (the GUI default model; older checkouts can force it
+with `--gguf cpp_ggml/models/gguf/lingbot-map-f16.gguf`) —
+two orders of magnitude below the official bf16 deployment self-noise, i.e.
+the GGML engine matches the Python reconstruction. The q8 default carries
+the q8 quantization loss instead (`1.31e-03` pose / `3.16e-03` depth over
+286 frames), which is the same loss PyTorch itself incurs decoding the same
+q8 weights — the engine is fully aligned; only the weight format differs.
+Full alignment matrix: `cpp_ggml/benchmarks/validation_report.md`.
+
+Vulkan q8 and f16 both pass the complete 286-frame gate. Run
+`bash cpp_ggml/scripts/run_e2e.sh vulkan f16` to reproduce the f16 result.
+
+**Fast mode (`--kv-f16 flash`)**: the same streams run through tensor-core
+flash attention with F32-effective PV numerics — F32 VKQ accumulation + P
+hi/lo split on CUDA, coopmat1 FA + P hi/lo + F32 output chain on Vulkan with
+scalar GEMMs — plus an F32 camera-trunk cache. It holds the same 1e-4-class
+parity at FlashInfer-class speed: over the full 286-frame stream, CUDA f16
+lands at pose 1.39e-04 / depth 4.55e-04 in **2m11s** (the PyTorch FlashInfer
+reference needs 2m14s) and Vulkan f16 at pose 7.27e-05 / depth 1.06e-04 in
+**2m39s**; f32 is the deepest reference (7.25e-05 / 1.35e-04 on Vulkan) and
+q8 carries only the documented q8 weight cost. The default strict mode
+remains the bit-level validation route (6m47s CUDA / 7m05s Vulkan).
+Engineering detail: `AGENTS.md`; measured matrix:
+`cpp_ggml/benchmarks/validation_report.md`.
+
+The detailed setup, limitations, model card, and generated evidence live in
+[`cpp_ggml/README.md`](cpp_ggml/README.md) and
+[`cpp_ggml/models/MODEL_CARD.md`](cpp_ggml/models/MODEL_CARD.md).
+
+#### GGML GUI reconstruction (one command)
+
+The same official viser reconstruction GUI as `demo.py` — RGB-D point clouds,
+camera frustums, trajectory, playback — driven by either the native GGML
+runtime or the official PyTorch pipeline, with one command and the same
+preprocessing / streaming profile on both sides, so the two reconstructions
+are directly comparable:
+
+```bash
+bash run_gui.sh                                        # auto engine, courthouse, all frames
+bash run_gui.sh --engine ggml --frames 40              # native C++ engine, quick look
+bash run_gui.sh --engine pytorch --image_folder example/loop   # official demo.py pipeline
+bash run_gui.sh --engine ggml --backend CUDA0          # picks build-cuda automatically
+bash run_gui.sh --engine ggml --backend CUDA0 --build cpp_ggml/build-cuda
+
+# Outdoor scenes with sky in view — mask_sky runs the NATIVE skyseg GGUF
+# inside the C++ CLI (no onnxruntime); masks are cached as PNGs and
+# original|mask|overlay panels are written next to the repo:
+bash run_gui.sh --engine ggml --mask_sky   --sky_mask_dir example/courthouse_ggml_sky_masks   --sky_mask_visualization_dir example/courthouse_sky_vis
+```
+
+The default `--engine auto` picks the official PyTorch pipeline when this
+machine has the `.pt` checkpoint and a torch environment, and the native
+GGML runtime otherwise; force one with `--engine ggml|pytorch`. The script
+auto-builds the C++ runtime on first run, probes the project venv, the
+system interpreters and every conda install for the required dependencies
+(`pip install viser trimesh` auto-installed when only those are missing),
+translates the shared convenience flags between the engines
+(`--frames` <-> demo.py's `--first_k`), auto-selects the SDPA attention
+backend when flashinfer is not installed, and opens `http://localhost:8080`.
+`--mask_sky` with the GGML engine runs a NATIVE ggml sky-segmentation model
+(`lingbot-map-skyseg-f16.gguf`, 100% mask agreement with the official
+onnxruntime path over the 8-frame courthouse stream, ~17.6 ms/frame on
+CUDA0 with an RTX 4090) — no onnxruntime required. The GGML engine streams: a live viser view
+grows point clouds and camera frustums frame-by-frame while the native
+runtime runs, then the full official viewer takes over on the same port when
+inference completes (disable the live phase with `--no-streaming_view`).
+Both engines default to the official crop rule
+(`--image_size 518`, aspect-preserving, snapped to the patch grid) and the
+upstream `scale=8/window=64` cache profile with the persistent F16 KV cache.
+Useful variants: `GGML_MODEL=cpp_ggml/models/gguf/lingbot-map-f16.gguf`
+for the higher-fidelity format, `--backend CUDA0 --build cpp_ggml/build-cuda`
+for CUDA. The `cpp_ggml/scripts/run_gui.sh` entry point is a thin forwarder
+with `--engine ggml` pre-selected. See the model card for the full capacity
+limits.
+
 After installation, run your first scene with one command:
 
 ```bash
@@ -153,6 +328,18 @@ This launches an interactive [viser](https://github.com/nerfstudio-project/viser
 ## 🎬 Interactive Demo (`demo.py`)
 
 Run `demo.py` for interactive 3D visualization via a browser-based [viser](https://github.com/nerfstudio-project/viser) viewer (default `http://localhost:8080`).
+
+Images are preprocessed with canonical crop to `--image_size` (square 518).
+The upstream `scale=8/window=64` profile runs end to end on a 24 GiB GPU when
+[FlashInfer](https://docs.flashinfer.ai/) is installed (bf16 paged KV cache,
+measured ~15-17 GB steady state); without it the SDPA fallback stores the K
+cache in fp32 and sits at ~21 GB — installable via
+`pip install flashinfer-python`, otherwise add `--use_sdpa`:
+
+```bash
+python demo.py --model_path /path/to/lingbot-map.pt \
+    --image_folder example/courthouse --use_sdpa
+```
 
 ### Try the Example Scenes
 

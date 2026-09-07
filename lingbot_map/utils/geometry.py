@@ -201,8 +201,8 @@ def closed_form_inverse_se3(se3, R=None, T=None):
 
 def closed_form_inverse_se3_general(se3, R=None, T=None):
     """
-    支持任意 batch 维度的 SE3 逆运算
-    se3: (..., 4, 4) 或 (..., 3, 4)
+    SE3 inverse supporting arbitrary batch dimensions.
+    se3: (..., 4, 4) or (..., 3, 4)
     """
     batch_shape = se3.shape[:-2]
     if R is None:
@@ -211,7 +211,7 @@ def closed_form_inverse_se3_general(se3, R=None, T=None):
         T = se3[..., :3, 3:]
     R_transposed = R.transpose(-2, -1)
     top_right = -R_transposed @ T
-    # 构造单位阵
+    # Build the identity matrix
     eye = torch.eye(4, 4, dtype=R.dtype, device=R.device)
     inverted_matrix = eye.expand(*batch_shape, 4, 4).clone()
     inverted_matrix[..., :3, :3] = R_transposed

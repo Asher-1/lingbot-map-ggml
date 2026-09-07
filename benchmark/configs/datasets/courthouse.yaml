@@ -1,0 +1,10 @@
+dataset: tum
+_raw_data_root: example/courthouse
+_load_img_size: 518
+evaluation:
+  traj:
+    enable: false
+  depth:
+    enable: false
+  points:
+    enable: false

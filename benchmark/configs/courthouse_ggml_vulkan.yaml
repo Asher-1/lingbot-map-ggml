@@ -1,0 +1,19 @@
+# Native GGML validation against the official 286-frame courthouse RGB scene.
+# The BSS artifact is prepared by the documented benchmark setup command.
+workspace: /tmp/lingbot-map-bss-courthouse-20260907
+
+datasets:
+  - courthouse
+
+methods:
+  - lingbot_map_ggml
+
+evaluation:
+  traj:
+    enable: false
+  auc:
+    enable: false
+  depth:
+    enable: false
+  points:
+    enable: false
