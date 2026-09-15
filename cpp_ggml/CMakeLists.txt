@@ -54,6 +54,10 @@ add_library(lingbot_map_ggml STATIC
 )
 target_include_directories(lingbot_map_ggml PUBLIC include)
 target_link_libraries(lingbot_map_ggml PUBLIC ggml)
+# model.cpp uses std::thread; on glibc < 2.34 libpthread is a separate DSO that
+# consumers of the static library must receive on the link line.
+find_package(Threads REQUIRED)
+target_link_libraries(lingbot_map_ggml PUBLIC Threads::Threads)
 target_compile_options(lingbot_map_ggml PRIVATE -Wall -Wextra -Wpedantic)
 
 if(LINGBOT_GGML_BUILD_TOOLS)

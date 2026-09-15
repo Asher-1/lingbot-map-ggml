@@ -24,6 +24,9 @@ def main():
     ap.add_argument('--frames', type=int, default=2)
     ap.add_argument('--kv-cache-scale', type=int, default=1)
     ap.add_argument('--kv-cache-window', type=int, default=4)
+    ap.add_argument('--kv-f16', choices=('none', 'strict', 'flash'), default='strict',
+                    help='persistent-cache attention mode passed to the CLI; '
+                         'strict is the parity-mode default (MODEL_CARD.md)')
     ap.add_argument('--out', type=Path, default=Path('cpp_ggml/benchmarks/reconstruction_compare.csv'))
     ap.add_argument('--effect-out', type=Path, default=Path('cpp_ggml/benchmarks/reconstruction_effect.png'))
     ap.add_argument('--full-export-prefix', type=Path,
@@ -59,11 +62,14 @@ def main():
     frames.tofile('/tmp/lingbot_scene.bin')
     lbo = Path('/tmp/lingbot_scene.lbo')
     cli = args.build / 'lingbot-map-cli'
-    env = dict(__import__('os').environ,
-               LINGBOT_KV_CACHE_SCALE=str(args.kv_cache_scale),
-               LINGBOT_KV_CACHE_WINDOW=str(args.kv_cache_window),
-               LINGBOT_NUM_SCALE_FRAMES=str(args.kv_cache_scale))
-    subprocess.run([str(cli), str(args.model), '/tmp/lingbot_scene.bin', args.backend, str(h), str(w), str(lbo), str(len(files))], check=True, env=env)
+    # The CLI reads its cache profile exclusively from named flags since the
+    # explicit-options refactor (former LINGBOT_KV_CACHE_* env reads are gone),
+    # so pass the same profile the PyTorch reference receives below.
+    subprocess.run([str(cli), str(args.model), '/tmp/lingbot_scene.bin', args.backend, str(h), str(w), str(lbo), str(len(files)),
+                    '--kv-f16', args.kv_f16,
+                    '--kv-scale', str(args.kv_cache_scale),
+                    '--kv-window', str(args.kv_cache_window),
+                    '--scale-frames', str(args.kv_cache_scale)], check=True)
     cpp_pose, cpp_depth = read_lbo(lbo)
     ref = Path('/tmp/lingbot_scene_ref.npz')
     reference_cmd = [PYTHON, str(Path(__file__).with_name('run_pytorch_reference.py')), 'cpp_ggml/models/pytorch/lingbot-map.pt', '/tmp/lingbot_scene.npy', str(ref), '--device', 'cuda', '--streaming', '--scale-frames', str(args.kv_cache_scale), '--kv-cache-scale', str(args.kv_cache_scale), '--kv-cache-window', str(args.kv_cache_window)]

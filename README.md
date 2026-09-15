@@ -155,6 +155,7 @@ pip install -e ".[vis]"
 | Model Name | Huggingface Repository | ModelScope Repository | Description |
 | :--- | :--- | :--- | :--- |
 | lingbot-map | [robbyant/lingbot-map](https://huggingface.co/robbyant/lingbot-map) | [Robbyant/lingbot-map](https://www.modelscope.cn/models/Robbyant/lingbot-map) | Balanced checkpoint (used in paper, benchmark and offline demo) — trade off all-around performance across short and long sequences. |
+| lingbot-map-long | [robbyant/lingbot-map](https://huggingface.co/robbyant/lingbot-map) | [Robbyant/lingbot-map](https://www.modelscope.cn/models/Robbyant/lingbot-map) | Long-sequence checkpoint — same architecture as `lingbot-map`, converted to `lingbot-map-long-{f32,f16,q8}.gguf` for the GGML engine (see `cpp_ggml/models/MODEL_CARD.md`). |
 | lingbot-map-stage1 | [robbyant/lingbot-map](https://huggingface.co/robbyant/lingbot-map) | [Robbyant/lingbot-map](https://www.modelscope.cn/models/Robbyant/lingbot-map) | Stage-1 training checkpoint of lingbot-map — can be loaded into the VGGT model for bidirectional inference (c2w). |
 
 > 🚧 **Coming soon:** we're training an stronger model that supports longer sequences — stay tuned.
@@ -183,11 +184,15 @@ pip install -e ".[vis]" && pip install --index-url https://pypi.org/simple flash
 # 3. Weights — download at least one of:
 huggingface-cli download robbyant/lingbot-map \
   lingbot-map.pt --local-dir cpp_ggml/models/pytorch          # official checkpoint (PyTorch engine)
+huggingface-cli download robbyant/lingbot-map \
+  lingbot-map-long.pt --local-dir cpp_ggml/models/pytorch     # long-sequence checkpoint (optional)
 huggingface-cli download Asher-1/lingbot-map-gguf \
   lingbot-map-q8.gguf lingbot-map-f16.gguf --local-dir cpp_ggml/models/gguf  # GGML engine
 # (f32/f16 GGUFs can also be converted locally from the .pt:
 #  python cpp_ggml/scripts/convert_lingbot.py cpp_ggml/models/pytorch/lingbot-map.pt \
-#    cpp_ggml/models/gguf/lingbot-map-f32.gguf --outtype f32)
+#    cpp_ggml/models/gguf/lingbot-map-f32.gguf --outtype f32
+#  long-checkpoint GGUFs ship as lingbot-map-long-{f32,f16,q8}.gguf in the
+#  same GGUF repo; select them with --gguf or GGML_MODEL)
 
 # 4. One-command GUI (auto-picks the engine per what this machine has)
 bash run_gui.sh

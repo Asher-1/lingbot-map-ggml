@@ -19,7 +19,8 @@ cpp_ggml/                  native C++ ggml runtime (the optimization surface)
   tools/fattn_stream_test.cpp  kernel-level FA-vs-F32 A/B harness
   third_party/ggml/        pinned ggml v0.21.0 submodule (all changes via patch, see below)
   third_party/patches/0001-lingbot-ggml-v021.patch  consolidated patch (10 files)
-  models/gguf/             lingbot-map-{q8,f16,f32}.gguf + lingbot-map-skyseg-*.gguf
+  models/gguf/             lingbot-map-{q8,f16,f32}.gguf + lingbot-map-long-{q8,f16,f32}.gguf
+                           + lingbot-map-skyseg-*.gguf
   models/MODEL_CARD.md     formats, contracts, capacity limits
   benchmarks/validation_report.md  final measured matrix + evidence charts
   scripts/                 conversion, e2e gate, references, plotting
@@ -196,6 +197,16 @@ changes live in the consolidated patch; all host changes in `cpp_ggml/src`.
 - **Verified stream length**: 286 frames (the bundled courthouse scene), the
   entire matrix above; the architecture carries no stream-length term beyond
   the special-token segment sizing.
+- **Long-checkpoint GGUFs** (`lingbot-map-long-{f32,f16,q8}.gguf`, converted
+  from upstream `lingbot-map-long.pt`, sha256 `832bc8...f409`): the long
+  checkpoint is architecture-identical to the balanced one (1342 tensors,
+  identical names/shapes), so the graph and every option apply unchanged.
+  Verified only to the 3-frame mirror gate on Vulkan0 at the bounded
+  `scale=1/window=4` profile (f16 pose 3.99e-06 / depth 4.05e-04; q8
+  6.12e-06 / 4.65e-04). No 286-frame/checkpoint-level contract, wall-clock
+  gate or `scale=8/window=64` long-stream validation exists for these
+  weights — `run_e2e.sh ... 286 long` first. `run_gui.sh` falls back to a
+  long GGUF only when no balanced GGUF is present.
 
 ## Validation Protocol (gate hierarchy)
 

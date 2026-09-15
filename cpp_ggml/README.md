@@ -146,7 +146,19 @@ Put the original checkpoint in `models/pytorch` and generated files in
 python3 cpp_ggml/scripts/convert_lingbot.py \
   cpp_ggml/models/pytorch/lingbot-map.pt \
   cpp_ggml/models/gguf/lingbot-map-f16.gguf --outtype f16
+# long-sequence checkpoint: identical architecture, same command shape
+python3 cpp_ggml/scripts/convert_lingbot.py \
+  cpp_ggml/models/pytorch/lingbot-map-long.pt \
+  cpp_ggml/models/gguf/lingbot-map-long-f16.gguf --outtype f16
 ```
+
+The `lingbot-map-long-*` GGUFs (f32/f16/q8) convert the upstream
+`lingbot-map-long.pt` checkpoint — architecture-identical to the balanced
+models, so every graph option and tool applies unchanged; their validation
+status and provenance (source sha256, smoke-gate numbers) live in
+`models/MODEL_CARD.md`. `run_e2e.sh` and `run_benchmarks.py` take a `long`
+variant argument (`run_e2e.sh vulkan f16 40 long`, `run_benchmarks.py
+--variant long`).
 
 The converter supports `f32`, `f16`, `q8`, and `q4`. Quantized tensors are
 limited to representable 2-D matrices; norms, biases, and convolution kernels

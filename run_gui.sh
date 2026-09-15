@@ -263,12 +263,16 @@ esac
 # Model priority: --gguf flag > GGML_MODEL env > f16 (full end-to-end
 # alignment with the official PyTorch pipeline, pose 1.72e-04 / depth
 # 4.72e-04 over 286 frames, see cpp_ggml/benchmarks/validation_report.md)
-# > q8 (memory-saving default, present on fresh clones).
+# > q8 (memory-saving default, present on fresh clones) > long-* (the
+# lingbot-map-long checkpoint conversion; only picked when no balanced
+# GGUF exists, since the long parity rows are not yet validated).
 MODEL="${GGML_MODEL:-}"
 [ -n "$GGUF_FLAG" ] && MODEL="$GGUF_FLAG"
 if [ -z "$MODEL" ]; then
   for f in "$ROOT"/cpp_ggml/models/gguf/lingbot-map-f16.gguf \
-           "$ROOT"/cpp_ggml/models/gguf/lingbot-map-q8.gguf; do
+           "$ROOT"/cpp_ggml/models/gguf/lingbot-map-q8.gguf \
+           "$ROOT"/cpp_ggml/models/gguf/lingbot-map-long-f16.gguf \
+           "$ROOT"/cpp_ggml/models/gguf/lingbot-map-long-q8.gguf; do
     [ -f "$f" ] && { MODEL="$f"; break; }
   done
 fi
@@ -278,6 +282,7 @@ if [ ! -f "$MODEL" ]; then
   echo "  curl -L -o $MODEL \\" >&2
   echo "    https://huggingface.co/Asher-1/lingbot-map-gguf/resolve/main/lingbot-map-q8.gguf" >&2
   echo "  (f16 matches the official PyTorch accuracy end to end: --gguf .../lingbot-map-f16.gguf)" >&2
+  echo "  (long-checkpoint variants: lingbot-map-long-{f16,q8}.gguf, pass --gguf explicitly)" >&2
   exit 2
 fi
 

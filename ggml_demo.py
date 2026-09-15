@@ -325,7 +325,8 @@ def run_ggml_inference(args, images, height, width, on_frame=None):
             f"GGUF model not found: {model}\n"
             "Download it per cpp_ggml/models/MODEL_CARD.md, e.g.\n"
             "  curl -L -o cpp_ggml/models/gguf/lingbot-map-q8.gguf "
-            "https://huggingface.co/Asher-1/lingbot-map-gguf/resolve/main/lingbot-map-q8.gguf")
+            "https://huggingface.co/Asher-1/lingbot-map-gguf/resolve/main/lingbot-map-q8.gguf\n"
+            "  (long-checkpoint variants: lingbot-map-long-{f32,f16,q8}.gguf in the same repo)")
     with tempfile.TemporaryDirectory(prefix="ggml-demo-") as tmp:
         bin_path = Path(tmp) / "frames.f32"
         out_path = Path(tmp) / "out.lbo"

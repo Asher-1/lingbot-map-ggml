@@ -12,6 +12,9 @@ def main():
     ap.add_argument("--build", type=Path, default=Path("build")); ap.add_argument("--models", type=Path, default=None)
     ap.add_argument("--pytorch", type=Path, default=None); ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--precisions", nargs="+", default=["f32", "f16", "q8", "q4"])
+    ap.add_argument("--variant", choices=("", "long"), default="",
+                    help="checkpoint variant: '' = balanced lingbot-map, "
+                         "'long' = lingbot-map-long GGUFs")
     ap.add_argument("--iters", type=int, default=5, help="measured iterations per row")
     ap.add_argument("--backends", nargs="+", default=["cpu", "cuda", "vulkan"])
     ap.add_argument("--allow-incomplete", action="store_true"); args = ap.parse_args()
@@ -25,8 +28,9 @@ def main():
     rows = []
     backend_args = {"cpu": "cpu", "cuda": "CUDA0", "vulkan": "Vulkan0"}
     for backend in ((name, backend_args[name]) for name in args.backends):
+        prefix = f"{args.variant}-" if args.variant else ""
         for precision in args.precisions:
-            model = models / f"lingbot-map-{precision}.gguf"
+            model = models / f"lingbot-map-{prefix}{precision}.gguf"
             if not model.is_file(): continue
             proc = subprocess.run([str(exe), str(model), backend[1], str(args.iters)], text=True, capture_output=True)
             for line in proc.stdout.splitlines():

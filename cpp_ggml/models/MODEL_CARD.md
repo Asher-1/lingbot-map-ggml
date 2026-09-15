@@ -1,6 +1,8 @@
+# github: https://github.com/Asher-1/lingbot-map-ggml
+
 # LingBot-Map GGUF Models
 
-Download the released GGUF files from [Asher-1/lingbot-map-gguf](https://huggingface.co/Asher-1/lingbot-map-gguf/tree/main) into `cpp_ggml/models/gguf/`. The original PyTorch checkpoint belongs in `cpp_ggml/models/pytorch/`.
+Download the released GGUF files from [Asher-1/lingbot-map-gguf](https://huggingface.co/Asher-1/lingbot-map-gguf/tree/main) into `cpp_ggml/models/gguf/`. The original PyTorch checkpoints (`lingbot-map.pt`, `lingbot-map-long.pt`) belong in `cpp_ggml/models/pytorch/`.
 
 | Model | Intended use | Verified backends | Accuracy contract | Memory note |
 |---|---|---|---|---|
@@ -15,6 +17,34 @@ was made for a bounded A/B test: retain the 24 global-attention blocks and the
 CameraCausalHead in F32 while leaving the rest in F16, then determine whether an
 observed pose drift comes from those components. Use `lingbot-map-f16.gguf` for
 the validated F16 deployment path.
+
+## Long-checkpoint conversion (`lingbot-map-long-*.gguf`)
+
+The three `long` GGUFs convert the upstream
+[`lingbot-map-long.pt`](https://huggingface.co/robbyant/lingbot-map/blob/main/lingbot-map-long.pt)
+checkpoint (sha256 `832bc82cbae0bc9bbe946ef5ee1f7226abd8c0e183ccf8beddbb3d133576f409`,
+4,632,303,465 bytes) with the same `scripts/convert_lingbot.py` defaults as the
+balanced models. The long checkpoint is **architecture-identical** to the
+balanced one — 1342 tensors, identical names and shapes (verified directly
+against both `.pt` files), with 1341 of 1342 weight values differing — so the
+C++ graph, GGUF metadata and every engine option apply unchanged; only the
+weights differ.
+
+| Model | Intended use | Verified backends | Accuracy contract | Memory note |
+|---|---|---|---|---|
+| `lingbot-map-long-f16.gguf` | Long-checkpoint deployment | Vulkan0, 3-frame mirror gate (bounded `scale=1/window=4`, strict F16 cache) | Graph parity vs the decoded same-format GGUF: pose `3.99e-06` / depth `4.05e-04` (`RECONSTRUCTION PASS`) | Same size as balanced f16 |
+| `lingbot-map-long-q8.gguf` | Memory-bound long-checkpoint deployment | Vulkan0, 3-frame mirror gate (same profile) | Graph parity: pose `6.12e-06` / depth `4.65e-04` (`RECONSTRUCTION PASS`) | Same size as balanced q8 |
+| `lingbot-map-long-f32.gguf` | Reference-grade long weights | Not gate-run | Tensor name/shape/dtype set identical to balanced f32 | Same size as balanced f32 |
+
+Validation status: the smoke gate above proves the engine loads and runs the
+long weights with graph-level parity. **No checkpoint-level contract exists
+yet**: the 286-frame end-to-end alignment rows, wall-clock gates and the
+`scale=8/window=64` long-stream cache profile were all established against
+the balanced checkpoint only, and the upstream long model's long-stream
+KV-cache behavior has not been characterized here. Run
+`bash cpp_ggml/scripts/run_e2e.sh vulkan f16 286 long` before trusting long
+GGUFs on long streams. `run_gui.sh` falls back to a long GGUF only when no
+balanced GGUF is present; pass `--gguf` explicitly to force one.
 
 ### End-to-end alignment with the official PyTorch pipeline (2026-09-10)
 

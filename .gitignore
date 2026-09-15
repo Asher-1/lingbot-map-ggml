@@ -27,3 +27,4 @@ docs/
 *.glb
 cpp_ggml/build-*/
 cpp_ggml/.cache/
+.vscode/

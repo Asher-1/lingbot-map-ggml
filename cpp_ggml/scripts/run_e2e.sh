@@ -7,24 +7,28 @@
 # Usage:
 #   bash cpp_ggml/scripts/run_e2e.sh cuda q8              # 286 frames, default
 #   bash cpp_ggml/scripts/run_e2e.sh vulkan f16 40        # quick 40-frame gate
+#   bash cpp_ggml/scripts/run_e2e.sh vulkan f16 40 long   # lingbot-map-long variant
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BACKEND=${1:-cuda}
 DTYPE=${2:-q8}
 FRAMES=${3:-286}
+# VARIANT: empty = balanced lingbot-map checkpoint; "long" = lingbot-map-long.
+VARIANT=${4:-}
+TAG="${VARIANT:+${VARIANT}_}"
 
 case "$BACKEND" in
   cuda) BUILD="$ROOT/cpp_ggml/build-cuda"; DEVICE=CUDA0; CMAKE_ARGS=(-DLINGBOT_GGML_CUDA=ON -DLINGBOT_GGML_CUDA_ARCHITECTURES=86-real -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc) ;;
   vulkan) BUILD="$ROOT/cpp_ggml/build-vulkan"; DEVICE=Vulkan0; CMAKE_ARGS=(-DLINGBOT_GGML_VULKAN=ON) ;;
-  *) echo "usage: $0 {cuda|vulkan} {q8|f16} [frames]" >&2; exit 2 ;;
+  *) echo "usage: $0 {cuda|vulkan} {q8|f16} [frames] [variant]" >&2; exit 2 ;;
 esac
 
-MODEL="$ROOT/cpp_ggml/models/gguf/lingbot-map-${DTYPE}.gguf"
+MODEL="$ROOT/cpp_ggml/models/gguf/lingbot-map-${VARIANT:+${VARIANT}-}${DTYPE}.gguf"
 SCENE="$ROOT/example/courthouse"
-OUT="$ROOT/cpp_ggml/benchmarks/current_${DTYPE}_${BACKEND}_courthouse.csv"
-EFFECT="$ROOT/cpp_ggml/benchmarks/current_${DTYPE}_${BACKEND}_courthouse.png"
-EXPORT="$ROOT/cpp_ggml/benchmarks/current_${DTYPE}_${BACKEND}_courthouse"
+OUT="$ROOT/cpp_ggml/benchmarks/current_${TAG}${DTYPE}_${BACKEND}_courthouse.csv"
+EFFECT="$ROOT/cpp_ggml/benchmarks/current_${TAG}${DTYPE}_${BACKEND}_courthouse.png"
+EXPORT="$ROOT/cpp_ggml/benchmarks/current_${TAG}${DTYPE}_${BACKEND}_courthouse"
 
 test -f "$MODEL" || { echo "missing $MODEL; see cpp_ggml/models/MODEL_CARD.md" >&2; exit 2; }
 test -d "$SCENE" || { echo "missing official scene $SCENE" >&2; exit 2; }
