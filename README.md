@@ -275,6 +275,20 @@ The detailed setup, limitations, model card, and generated evidence live in
 [`cpp_ggml/README.md`](cpp_ggml/README.md) and
 [`cpp_ggml/models/MODEL_CARD.md`](cpp_ggml/models/MODEL_CARD.md).
 
+**Real long-sequence evidence (2026-09-18)**: a 96-row end-to-end matrix over
+the three official demo sequences (`robbyant/lingbot-map-demo`: lingbo_world
+667 frames, drive 1050 frames, indoor 2000 frames) compares the C++ GGML
+engine against the official PyTorch pipeline at the official `scale=8/window=64`
+profile with the official auto `keyframe_interval = ceil(N/320)` (supported
+natively by the engine via `--keyframe-interval N`). Depth REL engine parity
+holds at the 1e-04 class on every dataset, mode (strict/flash) and weight
+format (f32/f16/q8); every GGML deviation stays below the official bf16
+deployment self-noise (which reaches pose 2.1e-01 on the drive scene).
+GGML flash CUDA matches PyTorch fp32 streaming wall-clock at ~2/3 the GPU
+memory. Tables, latency matrix, per-frame parity curves and cloud agreement:
+[`cpp_ggml/benchmarks/long_real/`](cpp_ggml/benchmarks/long_real/long_real_report.md)
+and `cpp_ggml/benchmarks/validation_report.md` §11.
+
 #### GGML GUI reconstruction (one command)
 
 The same official viser reconstruction GUI as `demo.py` — RGB-D point clouds,
@@ -289,6 +303,11 @@ bash run_gui.sh --engine ggml --frames 40              # native C++ engine, quic
 bash run_gui.sh --engine pytorch --image_folder example/loop   # official demo.py pipeline
 bash run_gui.sh --engine ggml --backend CUDA0          # picks build-cuda automatically
 bash run_gui.sh --engine ggml --backend CUDA0 --build cpp_ggml/build-cuda
+
+# Windowed mode for long sequences (both engines, same flags as demo.py):
+# each window is a fresh-cache streaming run, then windows are similarity-
+# aligned on the overlap and stitched (inference_windowed semantics):
+bash run_gui.sh --engine ggml --mode windowed --window_size 64 --overlap_size 16
 
 # Outdoor scenes with sky in view — mask_sky runs the NATIVE skyseg GGUF
 # inside the C++ CLI (no onnxruntime); masks are cached as PNGs and
@@ -315,6 +334,15 @@ inference completes (disable the live phase with `--no-streaming_view`).
 Both engines default to the official crop rule
 (`--image_size 518`, aspect-preserving, snapped to the patch grid) and the
 upstream `scale=8/window=64` cache profile with the persistent F16 KV cache.
+Both engines also share demo.py's inference modes: `--mode streaming`
+(default) and `--mode windowed` for long sequences — the GGML windowed path
+runs every window through the validated streaming primitive with a fresh KV
+cache (a fresh CLI process), then similarity-aligns consecutive windows on
+the overlap and stitches them with the de-duplicating slice table, matching
+`inference_windowed` (keyframe_interval=1, the demo.py windowed default;
+verified against the official PyTorch windowed output by
+`cpp_ggml/scripts/verify_windowed.py`: per-window pose `7.9e-05` / depth
+`5.3e-04`, cross-checked stitch `6.3e-05` / `4.3e-04`).
 Useful variants: `GGML_MODEL=cpp_ggml/models/gguf/lingbot-map-f16.gguf`
 for the higher-fidelity format, `--backend CUDA0 --build cpp_ggml/build-cuda`
 for CUDA. The `cpp_ggml/scripts/run_gui.sh` entry point is a thin forwarder
@@ -439,6 +467,13 @@ python demo.py --model_path /path/to/lingbot-map.pt \
     --video_path video.mp4 --fps 10 \
     --mode windowed --window_size 128 --overlap_keyframes 16 --keyframe_interval 2 
 ```
+
+The GGML engine (`run_gui.sh --engine ggml --mode windowed ...` or
+`ggml_demo.py --mode windowed`) supports the same windowed orchestration with
+the same flags (`--window_size`, `--overlap_size`, `--overlap_keyframes`) —
+each window runs the native streaming runtime with a fresh KV cache, then
+windows are similarity-aligned and stitched like `inference_windowed`
+(keyframe_interval=1).
 
 
 ### Sky Masking

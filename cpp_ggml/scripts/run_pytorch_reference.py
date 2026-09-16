@@ -37,6 +37,10 @@ def main():
     ap.add_argument("--scale-frames", type=int, default=1)
     ap.add_argument("--kv-cache-scale", type=int, default=1)
     ap.add_argument("--kv-cache-window", type=int, default=4)
+    ap.add_argument("--keyframe-interval", type=int, default=1,
+                    help="official keyframe policy: every N-th streaming frame "
+                         "persists its KV (non-keyframes attend and discard); "
+                         "demo.py auto-selects ceil(N/320) above 320 frames")
     ap.add_argument("--gguf", type=Path,
                     help="load decoded GGUF weights instead of the f32 checkpoint state")
     ap.add_argument("--autocast-f16", action="store_true",
@@ -238,7 +242,7 @@ def main():
         if args.streaming:
             predictions = model.inference_streaming(
                 inp, num_scale_frames=min(args.scale_frames, inp.shape[1]),
-                keyframe_interval=1, output_device=torch.device("cpu"))
+                keyframe_interval=args.keyframe_interval, output_device=torch.device("cpu"))
             pose = predictions["pose_enc"].float().numpy()
             depth = predictions["depth"][..., 0].float().numpy()
             depth_conf = predictions["depth_conf"].float().numpy()

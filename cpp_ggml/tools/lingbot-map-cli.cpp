@@ -39,6 +39,7 @@ int main(int argc, char ** argv) {
         else if (a == "--kv-window") options.kv_cache_window = std::atoi(next_value("--kv-window"));
         else if (a == "--kv-total") options.kv_total_frames = std::atoi(next_value("--kv-total"));
         else if (a == "--scale-frames") options.num_scale_frames = std::atoi(next_value("--scale-frames"));
+        else if (a == "--keyframe-interval") options.keyframe_interval = std::atoi(next_value("--keyframe-interval"));
         else if (a == "--no-kv-resident") options.kv_resident = false;
         else if (a == "--disable-kv-cache") options.disable_kv_cache = true;
         else if (a == "--force-f32-weights") options.force_f32_weights = true;
@@ -65,6 +66,7 @@ int main(int argc, char ** argv) {
             "options:\n"
             "  --kv-f16 none|strict|flash   persistent-cache attention mode (default none)\n"
             "  --kv-scale N / --kv-window N / --kv-total N / --scale-frames N\n"
+            "  --keyframe-interval N         persist KV only every N-th stream frame\n"
             "  --no-kv-resident / --disable-kv-cache / --force-f32-weights / --no-dpt-pos\n"
             "  --vulkan-fast / --vulkan-integer-dot / --repeat\n"
             "  --debug-kv / --debug-infer / --profile / --flat-off\n"

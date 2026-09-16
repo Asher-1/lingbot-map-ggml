@@ -1,0 +1,3 @@
+engine,scene,ate_rmse,depth_rmse
+ggml-f16-cuda0,courthouse,4.1264935134677216e-05,0.0005045007565058768
+pytorch-reference,courthouse,0.0,0.0

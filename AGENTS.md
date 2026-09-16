@@ -44,7 +44,8 @@ cmake --build cpp_ggml/build-vulkan --parallel 6
 # CLI (positional: MODEL IMAGE.bin BACKEND H W OUT FRAMES; named flags on top)
 cpp_ggml/build-cuda/lingbot-map-cli cpp_ggml/models/gguf/lingbot-map-f16.gguf \
     frames.bin CUDA0 294 518 out.lbo 286 \
-    --kv-f16 flash --kv-scale 8 --kv-window 64 --scale-frames 8 --kv-total 286
+    --kv-f16 flash --kv-scale 8 --kv-window 64 --scale-frames 8 --kv-total 286 \
+    --keyframe-interval 3
 
 # End-to-end parity gate (builds, runs 286 frames, compares vs decoded GGUF)
 bash cpp_ggml/scripts/run_e2e.sh cuda q8      # or: vulkan f16
@@ -201,12 +202,68 @@ changes live in the consolidated patch; all host changes in `cpp_ggml/src`.
   from upstream `lingbot-map-long.pt`, sha256 `832bc8...f409`): the long
   checkpoint is architecture-identical to the balanced one (1342 tensors,
   identical names/shapes), so the graph and every option apply unchanged.
-  Verified only to the 3-frame mirror gate on Vulkan0 at the bounded
-  `scale=1/window=4` profile (f16 pose 3.99e-06 / depth 4.05e-04; q8
-  6.12e-06 / 4.65e-04). No 286-frame/checkpoint-level contract, wall-clock
-  gate or `scale=8/window=64` long-stream validation exists for these
-  weights — `run_e2e.sh ... 286 long` first. `run_gui.sh` falls back to a
-  long GGUF only when no balanced GGUF is present.
+  Full 286-frame `scale=8/window=64` mirror-level validation landed
+  2026-09-15 (`scripts/run_long_matrix.sh` + `scripts/long_followup.sh`,
+  evidence in `benchmarks/validation_report.md` section 9): strict pose
+  `3.4–6.9e-05` on both backends and all three formats (balanced class),
+  strict wall CUDA 5m55s / Vulkan 6m36s; flash pose `5.1–8.5e-05`, wall CUDA
+  1m53–1m55s / Vulkan 2m21–2m28s. Depth carries a weight-format-independent
+  F16-cache scatter tail (~1.3–2.1% of pixels above 1.5e-03, RMSE ~5e-04)
+  that is **reproduced in PyTorch itself, not an engine defect**
+  (round-2 attribution 2026-09-16: with `LINGBOT_KV_CACHE_F16=1` the mirror
+  lands depth REL `2.44e-04` / tail `1.91%` on long vs C++ `2.22e-04` /
+  `1.93%`; balanced `1.58e-04` / `0.05%` vs C++ `1.20e-04` / `0.03%`; the
+  long:balanced relative-perturbation ratio is only 1.5x and the cache |V|
+  scales agree to 1.11x). The dominant amplifier of the absolute metrics is
+  the **long checkpoint's 3.3x larger predicted depth scale** on the scene
+  (mean |depth| 2.27 vs 0.70; tail pixels are far-range, median |depth| 7.0,
+  per-bin relative error ~1e-4 everywhere) — absolute gates are
+  depth-scale-weighted, so gate long depth on the relative view. With the
+  exact F32 cache (`--kv-f16 none`) the same weights land depth REL
+  `2.2e-05` with 0.00% tail. The elementwise depth gate therefore trips for
+  long under F16 cache; the authoritative long gates are the RECONSTRUCTION
+  RMSE gates and the F32-cache
+  route. Checkpoint level CLOSED 2026-09-15: `lingbot-map-long.pt` downloaded
+  (sha256 verified) and run as the fp32 checkpoint reference — the f32 GGUF is
+  a bit-exact conversion of the checkpoint, so its GGML rows are pure engine
+  parity (pose 3.6–6.0e-05); the f16/q8 checkpoint-level deviations are
+  dominated by the weight format itself (mirror-vs-checkpoint depth 1.8e-03 /
+  1.6e-02) with the engine adding only ~4–8e-05 pose / ~5e-04 depth
+  (`validation_report.md` section 9, checkpoint subsection). Windowed mode is
+  verified on the long weights at mirror level (per-window raw pose
+  `5.1–6.6e-05`, cross-checked stitch `1.2e-04` / `5.5e-04`). The only long
+  open item is the depth scatter tail itself — an upstream weight property,
+  nothing actionable here beyond the `--kv-f16 none` route. `run_gui.sh`
+  falls back to a long GGUF only when no balanced GGUF is present.
+- **Windowed mode (offline batch) is an orchestration layer, not engine
+  work**: `ggml_demo.py --mode windowed` (`run_gui.sh` passes the flags
+  through) splits the sequence per `inference_windowed`'s fixed-interval
+  rules, runs every window through the validated streaming primitive in a
+  fresh CLI process (= fresh KV cache, keyframe_interval=1), then aligns
+  consecutive windows with a numpy port of `_pairwise_alignment` /
+  `_warp_predictions` / `_stitch_windows`. pose_enc is **w2c** (decoder:
+  `w2c = [quat_mat | pe[:3]]`, c2w sidecar = inverse) — warp the c2w sidecar
+  as `R' = R_c2w @ R.T`, `t' = s·t_c2w − R_c2w @ (R.T t)` to stay the exact
+  decoder image of the official warp. Verified against the official PyTorch
+  `inference_windowed` by `scripts/verify_windowed.py`: per-window raw pose
+  `7.9e-05` / depth `5.3e-04`; cross-checked stitch (same alignment inputs)
+  `6.3e-05` / `4.3e-04` — orchestration is bit-faithful; the self-aligned
+  merged outputs differ ~1e-2 because each side's depth-ratio scale estimate
+  carries the method's own noise floor.
+- **Keyframe interval (official long-stream policy, engine-supported)**:
+  `--keyframe-interval N` (`model_options::keyframe_interval`) implements
+  `demo.py --keyframe_interval`: every N-th streaming frame persists its KV
+  (`is_keyframe = (i - scale) % N == 0`); non-keyframes attend to
+  `[special | scale | live | fresh]` and discard — no append, no eviction,
+  no specials (mirror `_set_skip_append`; C++ `graph_builder::skip_append`
+  guards the resident pre-evict/append, both capture pushes, and the camera
+  trunk). demo.py auto-selects `ceil(N/320)` for streaming above 320 frames —
+  pass it explicitly on both sides for deterministic comparisons; the
+  resident special segment is sized for stored keyframes, not raw stream
+  length. Verified (`cpp_ggml/scripts/long_real/verify_keyframe.sh`):
+  interval=1 is bit-identical to the pre-change build on all six cache
+  paths; interval 2/4 land pose/depth RMSE 5.7e-05/1.05e-04 and
+  1.02e-04/1.31e-04 vs the official mirror (the 1e-4 class of interval=1).
 
 ## Validation Protocol (gate hierarchy)
 
@@ -262,7 +319,10 @@ attribution.
    the pose output (the q8 force-F32 precedent). Symptom: depth fine, pose
    diverges from the second streaming frame. The trunk therefore keeps an F32
    cache in every mode, and the PyTorch mirror's `CausalAttention` has no cache
-   rounding at all.
+   rounding at all. The amplification acts on whatever the trunk delivers:
+   the q8mix experiment (f16 camera_head, q8 elsewhere) reproduced the full-q8
+   pose cost because the trunk's rounding perturbs the camera tokens before
+   the head ever runs — fixing the head's weights alone does not help.
 2. **Post-softmax noise compounds; pre-softmax dissipates** — F16 K/V and
    Q→F16 rounding are benign end to end (proven by mirror A/Bs); P rounding,
    PV-accumulator precision and output staging are amplified by the cache
@@ -300,6 +360,37 @@ attribution.
    repository, and adding one would also need a `_putenv`-based bridge
    (note `_putenv_s(k, "")` does *not* delete a variable; `_putenv("K=")`
    does).
+11. **Keyframe skips freeze the whole cache state, not just the append** —
+   a non-keyframe must not pre-evict, not append, not emit specials, and the
+   next keyframe must reuse the temporal slot it would have had (official
+   `total_frames_processed` does not advance; special-token tables are a
+   2-row first/stream table and RoPE is purely spatial, so nothing else may
+   advance either). Pre-evicting on a skip frame silently shifts the window
+   and diverges from `inference_streaming`.
+12. **Absolute depth gates are depth-scale-weighted** — the same engine delta
+   reads as RMSE ~1e-04 but max_abs up to ~2e-02 wherever the F16-cache
+   scatter tail lands (measured on 100-frame courthouse: interval=1 max_abs
+   1.63e-02, interval=2 2.72e-02, same class); always pair RMSE/REL with the
+   absolute view when gating or attributing (compare_parity's depth max_abs
+   gate trips by design on such scenes; use its RMSE columns and the
+   reconstruction RMSE gates).
+13. **Parity references must match the cache contract being gated** — a flash
+   row measured against an F32-cache mirror mixes the F16 K/V contract cost
+   into the engine number (pure-PyTorch-measurable: pose 2.38e-03 over the
+   1050-frame drive stream, first50 2.33e-05 -> lastQ 3.72e-03, §12.1 of
+   validation_report.md). Gate flash rows against the
+   `LINGBOT_KV_CACHE_F16=flash` mirror (strict rows: `=1`), or state the
+   F32-cache reference as a known upper bound. The attribution method that
+   decided §12: hold the weights constant, vary only the precision knob
+   under test, then compare engine-vs-checkpoint totals against
+   mirror-vs-checkpoint totals.
+14. **Per-tensor sensitivity does not predict end-to-end quantization cost** —
+   the q8mix experiment (q8 trunk+depth_head, f16 camera_head) landed in the
+   full-q8 pose class (3.0e-02) although the top-ranked tensor
+   (camera_head.pose_branch.fc2, 0.84% rel err) was kept in f16; the trunk's
+   collective q8 rounding dominates (§12.2). Mixed-precision q8 is closed as
+   a negative result; reducing the q8 pose cost requires an f16/f32 trunk
+   (= the f16 GGUF).
 
 ## Documentation Map
 

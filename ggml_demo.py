@@ -15,8 +15,19 @@ patch grid, center-cropped if taller than the target) and the upstream
 the exact configuration the 286-frame parity/reconstruction evidence in
 `cpp_ggml/benchmarks/` was measured at.
 
+Inference modes mirror `demo.py --mode` too:
+  - streaming (default): frame-by-frame with the persistent KV cache.
+  - windowed: overlapping windows for long sequences — each window runs the
+    streaming primitive above with a fresh KV cache (a fresh CLI process),
+    then consecutive windows are similarity-aligned on the overlap and
+    stitched with the de-duplicating slice table, matching
+    `GCTStream.inference_windowed` (keyframe_interval=1, the demo.py
+    windowed default; the native engine streams every frame).
+
 Example:
     python3 ggml_demo.py --image_folder example/courthouse --frames 40
+    python3 ggml_demo.py --image_folder example/courthouse --mode windowed \
+        --window_size 64 --overlap_size 16
 """
 import argparse
 import math
@@ -230,7 +241,11 @@ class StreamingViewer:
             except Exception:
                 pass
 
-    def add_frame(self, idx, image, depth, conf, c2w, intr):
+    def add_frame(self, idx, image, depth, conf, c2w, intr, key=None):
+        # Scene names are keyed by `key` (default: the frame index). Windowed
+        # mode renders the same global index once per window occurrence, so it
+        # passes a window-tagged key instead of overwriting the object.
+        name = key if key is not None else f"{idx:05d}"
         fx, fy, cx, cy = (float(v) for v in intr)
         H, W = depth.shape
         if not np.isfinite(depth).all() or not np.isfinite(c2w).all() or fx <= 0.0 or fy <= 0.0:
@@ -260,7 +275,7 @@ class StreamingViewer:
             world = np.zeros((0, 3), dtype=np.float32)
             colors = np.zeros((0, 3), dtype=np.uint8)
         self.server.scene.add_point_cloud(
-            f"/frames/{idx:05d}", points=world, colors=colors,
+            f"/frames/{name}", points=world, colors=colors,
             point_size=self.point_size, point_shape="circle")
         # camera frustum (viser cameras are OpenCV-convention, like the model's c2w)
         scale = None
@@ -278,7 +293,7 @@ class StreamingViewer:
                 scale = med * 0.35
         try:
             self.server.scene.add_camera_frustum(
-                f"/cams/{idx:05d}",
+                f"/cams/{name}",
                 fov=2.0 * math.atan2(H / 2.0, fy),
                 aspect=W / H,
                 wxyz=self._quat_wxyz(R),
@@ -350,11 +365,14 @@ def run_ggml_inference(args, images, height, width, on_frame=None):
         images.tofile(bin_path)
         # Explicit options: the CLI's named flags replaced the former
         # LINGBOT_* environment switches (see tools/lingbot-map-cli.cpp).
-        # Backward-compatible reading of LINGBOT_KV_CACHE_F16:
+        # --kv_f16 wins; backward-compatible fallback to LINGBOT_KV_CACHE_F16:
         #   "1" (default) -> strict, "flash" -> flash, "0" -> none.
-        _f16_raw = os.environ.get("LINGBOT_KV_CACHE_F16", "1")
-        _f16_flag = {"0": "none", "1": "strict", "flash": "flash"}.get(
-            _f16_raw.lower(), "strict")
+        if args.kv_f16 is not None:
+            _f16_flag = args.kv_f16
+        else:
+            _f16_raw = os.environ.get("LINGBOT_KV_CACHE_F16", "1")
+            _f16_flag = {"0": "none", "1": "strict", "flash": "flash"}.get(
+                _f16_raw.lower(), "strict")
         cmd += [
             "--kv-f16", _f16_flag,
             "--kv-scale", str(args.kv_cache_scale),
@@ -419,6 +437,206 @@ def run_ggml_inference(args, images, height, width, on_frame=None):
     return pose_enc, depth, c2w, intr, conf
 
 
+# ---------------------------------------------------------------------------
+# Windowed inference (demo.py --mode windowed / GCTStream.inference_windowed
+# alignment). Each window is the exact streaming primitive above run with a
+# fresh KV cache (a fresh CLI process == inference_windowed's per-window
+# clean_kv_cache); consecutive windows are then brought into the first
+# window's coordinate frame with a pairwise similarity (s, R, t) estimated on
+# the overlap and concatenated with a de-duplicating slice table. The
+# alignment math below is a numpy port of gct_stream_window.py's
+# _pairwise_alignment / _warp_predictions / _stitch_windows at the demo.py
+# windowed defaults (keyframe_interval=1: every frame is a keyframe, so the
+# anchor pair is the last overlap frame and the depth-ratio scale aggregates
+# the whole overlap).
+# ---------------------------------------------------------------------------
+
+def _quat_to_mat(q):
+    """Scalar-last (x, y, z, w) quaternions [..., 4] -> matrices [..., 3, 3].
+
+    Port of lingbot_map.utils.rotation.quat_to_mat (PyTorch3D).
+    """
+    i, j, k, r = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    two_s = 2.0 / np.maximum((q * q).sum(axis=-1), 1e-30)
+    o = np.stack((
+        1 - two_s * (j * j + k * k), two_s * (i * j - k * r), two_s * (i * k + j * r),
+        two_s * (i * j + k * r), 1 - two_s * (i * i + k * k), two_s * (j * k - i * r),
+        two_s * (i * k - j * r), two_s * (j * k + i * r), 1 - two_s * (i * i + j * j),
+    ), axis=-1)
+    return o.reshape(q.shape[:-1] + (3, 3))
+
+
+def _mat_to_quat(m):
+    """Rotation matrices [..., 3, 3] -> scalar-last quaternions (rotation.py)."""
+    m = m.reshape(m.shape[:-2] + (9,))
+    m00, m01, m02, m10, m11, m12, m20, m21, m22 = (m[..., i] for i in range(9))
+    q_abs = np.sqrt(np.maximum(np.stack((
+        1.0 + m00 + m11 + m22, 1.0 + m00 - m11 - m22,
+        1.0 - m00 + m11 - m22, 1.0 - m00 - m11 + m22), axis=-1), 0.0))
+    quat_by_rijk = np.stack((
+        np.stack([q_abs[..., 0] ** 2, m21 - m12, m02 - m20, m10 - m01], axis=-1),
+        np.stack([m21 - m12, q_abs[..., 1] ** 2, m10 + m01, m02 + m20], axis=-1),
+        np.stack([m02 - m20, m10 + m01, q_abs[..., 2] ** 2, m12 + m21], axis=-1),
+        np.stack([m10 - m01, m20 + m02, m21 + m12, q_abs[..., 3] ** 2], axis=-1),
+    ), axis=-2)
+    quat_candidates = quat_by_rijk / (2.0 * np.maximum(q_abs[..., None], 0.1))
+    idx = q_abs.argmax(axis=-1)  # best-conditioned candidate (largest denominator)
+    out = np.take_along_axis(quat_candidates, idx[..., None, None], axis=-2)[..., 0, :]
+    out = out[..., [1, 2, 3, 0]]  # rijk -> ijkr
+    return np.where(out[..., 3:4] < 0, -out, out)  # standardize: w >= 0
+
+
+def _split_windows(total, eff_window, eff_overlap):
+    """Window list per inference_windowed's fixed-interval branch."""
+    if eff_window >= total:
+        return [(0, total)]
+    windows = []
+    step = max(eff_window - eff_overlap, 1)
+    for start in range(0, total, step):
+        end = min(start + eff_window, total)
+        if end - start >= eff_overlap or end == total:
+            windows.append((start, end))
+        if end == total:
+            break
+    return windows
+
+
+def _pairwise_alignment(prev, curr, overlap):
+    """(s, R, t) mapping curr into prev's frame, estimated on the overlap.
+
+    keyframe_interval=1: the anchor is the last overlap frame and the
+    depth-ratio scale aggregates every overlap frame (the paired-keyframe
+    mask of _pairwise_alignment is all-true).
+    """
+    s = np.float32(1.0)
+    R = np.eye(3, dtype=np.float32)
+    t = np.zeros(3, dtype=np.float32)
+    if overlap <= 0:
+        return s, R, t
+    total_prev = prev["pose_enc"].shape[0]
+    total_curr = curr["pose_enc"].shape[0]
+    start = max(total_prev - overlap, 0)
+    eff = min(overlap, total_prev - start, total_curr)
+    if eff <= 0:
+        return s, R, t
+    da = prev["depth"][start:start + eff]   # (eff, H, W)
+    db = curr["depth"][:eff]
+    ok = np.isfinite(da) & np.isfinite(db) & (np.abs(db) > np.finfo(np.float32).eps)
+    if ok.any():
+        s = np.float32(np.clip(np.median(da[ok] / db[ok]), 1e-3, 1e3))
+    idx_a = start + eff - 1
+    Ra = _quat_to_mat(prev["pose_enc"][idx_a, 3:7].astype(np.float32))
+    Rb = _quat_to_mat(curr["pose_enc"][eff - 1, 3:7].astype(np.float32))
+    ca = prev["pose_enc"][idx_a, :3].astype(np.float32)
+    cb = curr["pose_enc"][eff - 1, :3].astype(np.float32)
+    R_ab = Ra @ Rb.T                          # Ra = R_ab @ Rb
+    t_ab = ca - s * (R_ab @ cb)               # ca = s * R_ab @ cb + t_ab
+    return s, R_ab.astype(np.float32), t_ab.astype(np.float32)
+
+
+def _warp_window(win, s, R, t):
+    """Apply the official window warp: pose_enc (center+quat) and c2w.
+
+    Matches _warp_predictions exactly. pose_enc encodes the w2c pose — the
+    decoder emits w2c = [quat_mat | pe[:3]] (verified against
+    pose_encoding_to_extri_intri, 0.0 deviation), so the decoder image of the
+    warped pose_enc for the c2w sidecar is R'_c2w = R_c2w @ R.T and
+    t'_c2w = s * t_c2w - R_c2w @ (R.T @ t); warping the sidecar this way keeps
+    the merged c2w equal to decode(merged pose_enc) with no torch decoder.
+    """
+    pe = win["pose_enc"].copy()
+    rot = _quat_to_mat(pe[:, 3:7])
+    pe[:, :3] = s * np.einsum("ab,nb->na", R, pe[:, :3]) + t
+    pe[:, 3:7] = _mat_to_quat(np.einsum("ab,nbc->nac", R, rot))
+    out = dict(win)
+    out["pose_enc"] = pe
+    out["depth"] = win["depth"] * s
+    Rt = R.T
+    c2w = win["c2w"].copy()
+    c2w[:, :3, :3] = np.einsum("nij,jk->nik", win["c2w"][:, :3, :3], Rt)
+    c2w[:, :3, 3] = (s * win["c2w"][:, :3, 3]
+                     - np.einsum("nij,j->ni", win["c2w"][:, :3, :3], Rt @ t))
+    out["c2w"] = c2w
+    return out
+
+
+def _stitch_windows(windows, overlap):
+    """Concatenate per-window predictions, de-duplicating the overlaps.
+
+    Every non-final window contributes [0, total - overlap) frames — the
+    slice table of gct_stream_window.py:_stitch_windows.
+    """
+    n = len(windows)
+    out = {}
+    for k in windows[0]:
+        parts = []
+        for i, w in enumerate(windows):
+            end = w[k].shape[0] if i == n - 1 else max(w[k].shape[0] - overlap, 0)
+            if end > 0:
+                parts.append(w[k][:end])
+        out[k] = np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+    return out
+
+
+def run_ggml_windowed(args, images, height, width, on_frame=None):
+    """Windowed inference over [S,3,H,W], aligned with demo.py --mode windowed.
+
+    Windows follow inference_windowed's fixed-interval rules with the demo.py
+    windowed defaults (keyframe_interval=1): actual window frames =
+    window_size, overlap from --overlap_keyframes (clamped up to
+    num_scale_frames) else --overlap_size. Every window runs the streaming
+    primitive in a fresh CLI process (fresh KV cache), then windows are
+    similarity-aligned into the first window's frame and stitched.
+    """
+    S = images.shape[0]
+    ws = max(1, min(args.num_scale_frames, S))
+    kf_int = 1  # the native engine streams every frame (no skip_append)
+    if args.overlap_keyframes is not None:
+        eff_overlap = max(ws, args.overlap_keyframes * kf_int)
+    elif args.overlap_size is not None:
+        eff_overlap = args.overlap_size
+    else:
+        eff_overlap = ws
+    eff_overlap = min(eff_overlap, S - 1) if S > 1 else 0
+    eff_window = min(ws + max(args.window_size - ws, 0) * kf_int, S)
+    windows = _split_windows(S, eff_window, eff_overlap)
+    print(f"Windowed inference: {len(windows)} window(s) {windows} "
+          f"(window_size={args.window_size}, overlap={eff_overlap}, scale={ws})")
+
+    # Native skyseg caches masks by CLI-run-local frame index; give each
+    # window its own cache/visualization subdirectory so a windowed run
+    # never reuses another window's mask for a different physical frame.
+    win_args = args
+    if args.mask_sky and Path(args.skyseg).is_file():
+        import copy
+        win_args = copy.copy(args)
+        base_m = args.sky_mask_dir or "ggml_sky_masks"
+        base_v = args.sky_mask_visualization_dir or (base_m + "_vis")
+
+    warped = []
+    for wi, (start, end) in enumerate(windows):
+        if win_args is not args:
+            win_args.sky_mask_dir = f"{base_m}/win{wi:02d}"
+            win_args.sky_mask_visualization_dir = f"{base_v}/win{wi:02d}"
+        cb = None
+        if on_frame is not None:
+            cb = (lambda idx, f, _s=start, _w=wi: on_frame(_s + idx, f, _w))
+        print(f"[window {wi + 1}/{len(windows)}] frames [{start}, {end}) ...")
+        pose_enc, depth, c2w, intr, conf = run_ggml_inference(
+            win_args, images[start:end], height, width, on_frame=cb)
+        win = {"pose_enc": pose_enc, "depth": depth, "depth_conf": conf,
+               "c2w": c2w, "intrinsics": intr}
+        if wi > 0:
+            s_ab, R_ab, t_ab = _pairwise_alignment(warped[-1], win, eff_overlap)
+            print(f"[window {wi + 1}] alignment scale={s_ab:.6f} "
+                  f"t=[{t_ab[0]:.4f} {t_ab[1]:.4f} {t_ab[2]:.4f}]")
+            win = _warp_window(win, s_ab, R_ab, t_ab)
+        warped.append(win)
+    merged = _stitch_windows(warped, eff_overlap)
+    return (merged["pose_enc"], merged["depth"], merged["c2w"],
+            merged["intrinsics"], merged["depth_conf"])
+
+
 def build_pred_dict(args, images, depth, c2w, intr, conf):
     """Assemble the exact pred_dict contract of PointCloudViewer._process_pred_dict.
 
@@ -462,7 +680,28 @@ def main():
     ap.add_argument("--kv_cache_scale", type=int, default=8)
     ap.add_argument("--kv_cache_window", type=int, default=64)
     ap.add_argument("--num_scale_frames", type=int, default=8)
+    # Inference mode + windowed options, aligned with demo.py --mode
+    # streaming|windowed (--window_size / --overlap_size / --overlap_keyframes).
+    ap.add_argument("--mode", type=str, default="streaming", choices=["streaming", "windowed"],
+                    help="streaming: frame-by-frame with the persistent KV cache; "
+                         "windowed: overlapping windows for long sequences — each "
+                         "window is a fresh-cache streaming run, then windows are "
+                         "similarity-aligned and stitched (inference_windowed)")
+    ap.add_argument("--window_size", type=int, default=64,
+                    help="frames per window (windowed mode)")
+    ap.add_argument("--overlap_size", type=int, default=16,
+                    help="overlap between windows in frames (windowed mode)")
+    ap.add_argument("--overlap_keyframes", type=int, default=None,
+                    help="overlap in keyframes; overrides --overlap_size and is "
+                         "clamped up to --num_scale_frames (windowed mode)")
     # Viewer parameters, aligned with demo.py
+    ap.add_argument("--kv_f16", type=str, default=None,
+                    choices=["strict", "flash", "none"],
+                    help="KV cache precision contract (default: strict, or the "
+                         "LINGBOT_KV_CACHE_F16 env). 'none' = exact F32 cache: "
+                         "tightest parity (2000-frame long stream: pose 8.6e-05 "
+                         "vs strict 5.9e-04) and no F16-cache depth scatter tail "
+                         "(0.00%%), at roughly +4 GB resident payload and ~2x wall")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--conf_threshold", type=float, default=1.5)
     ap.add_argument("--downsample_factor", type=int, default=10)
@@ -558,13 +797,18 @@ def main():
             print(f"streaming view unavailable ({exc}); falling back to console progress")
             stream = None
 
-    print("Running native GGML inference (this streams frame-by-frame)...")
+    print(f"Running native GGML inference ({args.mode}, streams frame-by-frame)...")
     try:
-        def on_frame(idx, frame):
+        def on_frame(idx, frame, tag=0):
             if stream is not None:
+                # Windowed mode renders the same global index once per window
+                # occurrence; tag the scene names so nothing is overwritten.
+                key = f"w{tag:02d}_{idx:05d}" if tag else f"{idx:05d}"
                 stream.add_frame(idx, images[idx], frame["depth"],
-                                 frame["depth_conf"], frame["c2w"], frame["intrinsics"])
-        pose_enc, depth, c2w, intr, conf = run_ggml_inference(
+                                 frame["depth_conf"], frame["c2w"],
+                                 frame["intrinsics"], key=key)
+        runner = run_ggml_windowed if args.mode == "windowed" else run_ggml_inference
+        pose_enc, depth, c2w, intr, conf = runner(
             args, images, height, width, on_frame=on_frame if stream else None)
     except SystemExit:
         if stream is not None:

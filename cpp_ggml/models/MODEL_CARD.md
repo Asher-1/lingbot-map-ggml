@@ -32,19 +32,59 @@ weights differ.
 
 | Model | Intended use | Verified backends | Accuracy contract | Memory note |
 |---|---|---|---|---|
-| `lingbot-map-long-f16.gguf` | Long-checkpoint deployment | Vulkan0, 3-frame mirror gate (bounded `scale=1/window=4`, strict F16 cache) | Graph parity vs the decoded same-format GGUF: pose `3.99e-06` / depth `4.05e-04` (`RECONSTRUCTION PASS`) | Same size as balanced f16 |
-| `lingbot-map-long-q8.gguf` | Memory-bound long-checkpoint deployment | Vulkan0, 3-frame mirror gate (same profile) | Graph parity: pose `6.12e-06` / depth `4.65e-04` (`RECONSTRUCTION PASS`) | Same size as balanced q8 |
-| `lingbot-map-long-f32.gguf` | Reference-grade long weights | Not gate-run | Tensor name/shape/dtype set identical to balanced f32 | Same size as balanced f32 |
+| `lingbot-map-long-f16.gguf` | Long-checkpoint deployment | CUDA and Vulkan, 286-frame strict + flash at `scale=8/window=64` (2026-09-15) | Graph parity vs the decoded same-GGUF mirror over the full 286-frame stream: strict pose `3.4–6.9e-05` (backends) / depth `~5e-04` absolute (= REL `2.2e-04`; the absolute tail above 1.5e-03 covers ~1.3–2.1% of pixels **because the long checkpoint predicts a 3.3x larger depth scale on this scene** — the tail reproduces in PyTorch with the same F16 cache, so it is not an engine effect); flash pose `5.1–8.5e-05` / depth `6.4–9.2e-04` (same class). The exact-F32-cache route (`--kv-f16 none`) holds depth REL `2.2e-05` with 0.00% tail | Same size as balanced f16 |
+| `lingbot-map-long-q8.gguf` | Memory-bound long-checkpoint deployment | CUDA and Vulkan, 286-frame strict + flash (2026-09-15) | Same graph-parity class as long f16 (strict pose `3.8–6.9e-05` / depth `~4.9e-04`); the depth tail is weight-format independent (cache rounding, see above) | Same size as balanced q8 |
+| `lingbot-map-long-f32.gguf` | Reference-grade long weights | CUDA and Vulkan, 286-frame strict + flash (2026-09-15) | Same graph-parity class (strict pose `3.6–6.0e-05` / depth `~5e-04`) — the deepest-precision long weights land on the same cache-precision depth tail as f16/q8, confirming the attribution | Same size as balanced f32 |
 
-Validation status: the smoke gate above proves the engine loads and runs the
-long weights with graph-level parity. **No checkpoint-level contract exists
-yet**: the 286-frame end-to-end alignment rows, wall-clock gates and the
-`scale=8/window=64` long-stream cache profile were all established against
-the balanced checkpoint only, and the upstream long model's long-stream
-KV-cache behavior has not been characterized here. Run
-`bash cpp_ggml/scripts/run_e2e.sh vulkan f16 286 long` before trusting long
-GGUFs on long streams. `run_gui.sh` falls back to a long GGUF only when no
-balanced GGUF is present; pass `--gguf` explicitly to force one.
+Walls (286 frames, RTX 4090, native aspect 518x294, `scale=8/window=64`):
+strict CUDA 5m54–5m56s / Vulkan 6m35–6m38s; flash CUDA 1m53–1m55s /
+Vulkan 2m21–2m28s (f32 2m17s; re-measured twice after a 3m21s matrix-session
+outlier). Evidence:
+`cpp_ggml/benchmarks/validation_report.md` section 9,
+`cpp_ggml/benchmarks/current_long_*`.
+
+Validation status (2026-09-15/16, checkpoint level CLOSED): the long GGUFs
+carry the full mirror-level 286-frame contract at the shipped streaming
+profile (pose at the balanced class; depth REL 2.2e-04 with the absolute
+scatter tail explained by the long checkpoint's 3.3x larger predicted depth
+scale — the tail reproduces in PyTorch under the same F16 cache, so it is
+not an engine effect; 0.00% tail on the exact F32 cache) AND the
+checkpoint-level rows against the upstream `lingbot-map-long.pt` (sha256
+verified): the f32 GGUF is a bit-exact conversion of the checkpoint, so its
+GGML rows are pure engine parity (pose 3.6–6.0e-05); the f16/q8
+checkpoint-level deviations are dominated by the weight format itself
+(mirror-vs-checkpoint pose 1.3e-04 / 1.1e-03, depth 1.8e-03 / 1.6e-02) with
+the engine adding only ~4–8e-05 pose / ~5e-04 depth. Deployment view: all
+twelve GGML long rows sit at PyTorch's own bf16 self-noise versus the
+bf16 SDPA deployment (pose 2.06–2.28e-03 / depth REL 3.95–4.04e-02 vs
+self-noise 2.08e-03 / 3.95e-02) — no engine-separable error. Speed: GGML
+long matches balanced within ±4% in every mode/backend; PyTorch long runs
+124s streaming fp32 / 53s bf16 (SDPA) on the same host. Windowed mode
+(`--mode windowed`) is verified on the long weights at mirror level
+(per-window raw pose 5.1–6.6e-05, cross-checked stitch 1.2e-04 / 5.5e-04 —
+`scripts/verify_windowed.py`). The elementwise `compare_parity.py` depth
+gate trips on the depth-scale-weighted absolute tail (pose passes
+everywhere); treat the RECONSTRUCTION RMSE gates plus the `--kv-f16 none`
+route as the authoritative long gates. `run_gui.sh` falls back to a long
+GGUF only when no balanced GGUF is present; pass `--gguf` explicitly to
+force one.
+
+### Experimental format: mixed quantization (`lingbot-map-long-q8mix.gguf`) — closed negative
+
+A 1.47 GB experiment (q8 aggregator+depth_head, f16 camera_head) testing
+whether keeping the camera head in f16 removes the q8 pose cost. It does
+not: the weight cost vs the fp32 checkpoint (pose 3.01e-02 / depth REL
+3.15e-02 over the 1050-frame drive stream) stays in the full-q8 class,
+because the q8 rounding of the aggregator trunk alone reproduces it (pose
+3.30e-02, measured with the camera head f16 on BOTH sides). The pose
+amplification source is the trunk feeding the camera tokens, not the
+camera-head weights; per-tensor sensitivity rankings (the 0.84% fc2
+tensor) do not predict this. Reducing the q8 pose cost requires an
+f16/f32 trunk, which is the f16 GGUF. The engine adds nothing on mixed
+weights either (strict parity 1.54e-03, the strict class). Attribution:
+`validation_report.md` §12.2 and
+`benchmarks/long_real/drive/attribute_p1p2.csv`. Not a release format;
+kept only as the experiment artifact.
 
 ### End-to-end alignment with the official PyTorch pipeline (2026-09-10)
 
@@ -89,6 +129,19 @@ there. Use the release `scale=1/window=4` profile for 518x518 on 12 GiB
 hardware, or the native-aspect 518x294 profile (the identity output of the
 official crop rule for the bundled example scenes) for the best quality.
 
+### Keyframe interval (official long-stream policy)
+
+`--keyframe-interval N` implements `demo.py --keyframe_interval`: every N-th
+streaming frame persists its KV; the rest attend and discard. The official
+demo auto-selects `ceil(N/320)` for streaming runs above 320 frames — pass
+the same value on both engines for comparable runs. With the interval set,
+the resident special-token segment is sized for stored keyframes rather than
+the raw stream length (`--kv-total` stays the total stream length). Verified
+against the official `inference_streaming` mirror at interval 2/4
+(pose/depth RMSE 1e-04-class, `scripts/long_real/verify_keyframe.sh`) and
+bit-identical at interval=1. Real official-demo long-sequence evidence:
+`benchmarks/long_real/`.
+
 The deployment contract is not the filename alone. Run `bash cpp_ggml/scripts/run_e2e.sh cuda q8` or `bash cpp_ggml/scripts/run_e2e.sh vulkan f16`; the command builds the selected backend, runs official `courthouse` at the native aspect, compares against an independently decoded matching GGUF in PyTorch with cuDNN disabled, and writes scene/PLY/image evidence under `cpp_ggml/benchmarks/`. The shipped cache profile is `scale=8/window=64` with the persistent F16 KV cache (the same profile as the official PyTorch pipeline), validated end to end on both backends at the native aspect and at 392x392 / 518x378; the bounded `scale=1/window=4` profile remains available for 12 GiB hardware.
 
 ### F16 KV cache (LINGBOT_KV_CACHE_F16)
@@ -118,6 +171,27 @@ streaming cache upload:
   q8 CUDA/Vulkan 1.33e-03 / 3.17e-03 (the documented q8 weight cost,
   identical to the strict q8 rows).
 - The scale pass always keeps exact F32 attention in every mode.
+
+### Exact F32 KV cache (`--kv-f16 none`)
+
+The tightest-parity route: the KV cache stays F32 (legacy sidecar path),
+so the F16-cache rounding contract and its depth scatter tail disappear
+entirely. Validated on the official long streams at the shipped profile
+(`scale=8/window=64`, auto keyframe interval):
+
+| scene | pose parity (vs same-weights mirror) | depth REL | tail > 1.5e-03 |
+|---|---|---|---|
+| indoor 2000f CUDA | 8.56e-05 (strict F16 cache: 5.90e-04) | 3.87e-05 | 0.00% |
+| indoor 2000f Vulkan | 5.75e-05 (strict: 2.67e-04) | 5.85e-06 | 0.00% |
+| courthouse 286f | depth REL 2.2e-05 (validation_report.md §9) | — | 0.00% |
+
+Trade-offs: the resident KV payload roughly doubles (indoor 2000f CUDA
+process peak 17.4 GB vs 13.4 GB) and the wall roughly doubles (5340 s vs
+2811 s — the F32-cache path is the legacy sidecar, not the fused
+device-resident one). Attribution (validation_report.md §12.3): the
+F16-cache cost is a numerics contract, not an engine defect; `none` is
+the exactness escape hatch. GUI: `run_gui.sh --engine ggml --exact` or
+`ggml_demo.py --kv_f16 none`.
 
 Non-square resolutions additionally depend on the fixed native DINO
 positional resampler (verified to `max_abs=1.9e-07` on the 37x27 grid;

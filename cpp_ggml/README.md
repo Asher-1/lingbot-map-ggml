@@ -75,12 +75,20 @@ bash run_gui.sh                                        # ggml, courthouse, all f
 bash run_gui.sh --engine ggml --frames 40              # quick look
 bash run_gui.sh --engine pytorch --image_folder example/loop
 bash run_gui.sh --engine ggml --backend CUDA0 --build cpp_ggml/build-cuda
+bash run_gui.sh --engine ggml --mode windowed --window_size 64 --overlap_size 16
 
 With the default settings the GGML engine opens a live viser view
 immediately and grows point clouds + camera frustums frame-by-frame
 during the native streaming run; the full official viewer takes over
 on the same port when inference completes.
 ```
+
+Both engines share demo.py's `--mode streaming|windowed`. The GGML windowed
+path runs every window through the validated streaming primitive with a fresh
+KV cache (a fresh CLI process), then similarity-aligns consecutive windows on
+the overlap and stitches them (numpy port of `inference_windowed`'s
+`_pairwise_alignment` / `_warp_predictions` / `_stitch_windows`;
+keyframe_interval=1). Verification: `scripts/verify_windowed.py`.
 
 The script probes system/conda/venv interpreters for the viewer dependencies
 (`pip install viser trimesh`), auto-installs them when only those are missing,
@@ -229,6 +237,20 @@ python run.py --config configs/<dataset>.yaml --debug --force
 ```
 
 ## Current Evidence
+
+**Real long-sequence campaign (2026-09-18)**: 96-row matrix over the three
+official demo sequences (lingbo_world 667f, drive 1050f, indoor 2000f; the
+official `scale=8/window=64` profile with the official auto
+`keyframe_interval = ceil(N/320)`) — PyTorch {long, bal} x {fp32, bf16,
+per-format mirrors} + GGML {long, bal} x {f32, f16, q8} x {CUDA, Vulkan} x
+{strict, flash}, every row monitored for wall/FPS/GPU/RSS. Headline: depth
+REL engine parity is 1e-04-class on every dataset/mode/format; every GGML
+deviation sits below the official bf16 deployment self-noise (up to pose
+2.1e-01 on drive); GGML flash CUDA matches PT fp32 streaming wall-clock at
+~2/3 the GPU memory. Evidence: `benchmarks/long_real/<ds>/` and
+`benchmarks/long_real/long_real_report.md`; engine-side keyframe support:
+`--keyframe-interval N` (verified bit-identical at interval=1,
+`scripts/long_real/verify_keyframe.sh`).
 
 The full parity table (eight rows at the native aspect plus three stretched
 profiles, both backends, q8 GGUF, F16 KV cache, 286 frames each) lives in

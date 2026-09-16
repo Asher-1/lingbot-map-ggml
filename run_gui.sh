@@ -25,7 +25,18 @@
 #   bash run_gui.sh --engine pytorch --image_folder example/courthouse
 #   bash run_gui.sh --engine ggml --backend CUDA0               # picks build-cuda
 #   bash run_gui.sh --engine ggml --gguf cpp_ggml/models/gguf/lingbot-map-f16.gguf
+#   bash run_gui.sh --engine ggml --exact                       # exact F32 KV cache (tightest parity)
+#   bash run_gui.sh --engine ggml --mode windowed --window_size 64 --overlap_size 16
 #   PYTHON=/path/to/python bash run_gui.sh --engine pytorch --mask_sky
+#
+# Inference modes (both engines, same flag names):
+#   --mode streaming   frame-by-frame with the persistent KV cache [default]
+#   --mode windowed    overlapping windows for long sequences: each window is a
+#                      fresh-cache streaming run, then windows are similarity-
+#                      aligned on the overlap and stitched (ggml: inference_windowed
+#                      semantics in ggml_demo.py; pytorch: demo.py --mode windowed).
+#                      window_size / overlap_size / overlap_keyframes pass through
+#                      to either engine unchanged.
 #
 # Outdoor scenes (sky in view) add --mask_sky: the ggml engine runs the
 # NATIVE skyseg GGUF inside the C++ CLI (no onnxruntime), zeroing sky-pixel
@@ -45,8 +56,13 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$ROOT"
 
+# --mode flows to either engine unchanged (demo.py and ggml_demo.py share the
+# streaming|windowed vocabulary and the same windowed option names), so the
+# only flag needing translation between the engines remains --frames/--first_k.
+
 ENGINE=auto
 GGUF_FLAG=""
+EXACT=0
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,7 +70,8 @@ while [ $# -gt 0 ]; do
     --engine=*) ENGINE="${1#*=}"; shift ;;
     --gguf) GGUF_FLAG="${2:-}"; shift 2 ;;
     --gguf=*) GGUF_FLAG="${1#*=}"; shift ;;
-    -h|--help) sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+    --exact) EXACT=1; shift ;;
+    -h|--help) sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
@@ -219,6 +236,9 @@ if [ "$RESOLVED" = pytorch ]; then
     exit 2
   fi
   echo "Checkpoint: $CKPT"
+  # --exact is a no-op here: the PyTorch engine always runs the exact fp32
+  # cache, so there is nothing to tighten.
+  [ "$EXACT" = 1 ] && echo "note: --exact ignored (the PyTorch engine always runs the exact fp32 cache)"
   # flashinfer is the demo default; fall back to SDPA automatically when it
   # is not installed so the engine still runs everywhere.
   if ! "$PYTHON_BIN" -c "import flashinfer" > /dev/null 2>&1; then
@@ -264,8 +284,10 @@ esac
 # alignment with the official PyTorch pipeline, pose 1.72e-04 / depth
 # 4.72e-04 over 286 frames, see cpp_ggml/benchmarks/validation_report.md)
 # > q8 (memory-saving default, present on fresh clones) > long-* (the
-# lingbot-map-long checkpoint conversion; only picked when no balanced
-# GGUF exists, since the long parity rows are not yet validated).
+# lingbot-map-long checkpoint conversion; mirror/checkpoint/deployment
+# contracts all landed 2026-09-15/16, validation_report.md section 9 —
+# still only picked when no balanced GGUF exists, since the balanced
+# checkpoint remains the release default; pass --gguf to force one).
 MODEL="${GGML_MODEL:-}"
 [ -n "$GGUF_FLAG" ] && MODEL="$GGUF_FLAG"
 if [ -z "$MODEL" ]; then
@@ -282,7 +304,7 @@ if [ ! -f "$MODEL" ]; then
   echo "  curl -L -o $MODEL \\" >&2
   echo "    https://huggingface.co/Asher-1/lingbot-map-gguf/resolve/main/lingbot-map-q8.gguf" >&2
   echo "  (f16 matches the official PyTorch accuracy end to end: --gguf .../lingbot-map-f16.gguf)" >&2
-  echo "  (long-checkpoint variants: lingbot-map-long-{f16,q8}.gguf, pass --gguf explicitly)" >&2
+  echo "  (long-checkpoint variants: lingbot-map-long-{f32,f16,q8}.gguf, fully validated — pass --gguf explicitly)" >&2
   exit 2
 fi
 
@@ -320,6 +342,13 @@ echo "GGUF: $MODEL"
 echo "Build: $BUILD"
 
 translate_arg --first_k --frames
+# --exact: run with the exact F32 KV cache (--kv-f16 none) instead of the
+# default F16 one. Validated on the official 2000-frame long stream: pose
+# parity tightens ~7x (strict 5.90e-04 -> 8.56e-05 CUDA) and the F16-cache
+# depth scatter tail disappears (0.00%), at roughly +4 GB resident payload
+# and ~2x wall (validation_report.md §12.3, MODEL_CARD.md).
+EXTRA_ARGS=()
+[ "$EXACT" = 1 ] && EXTRA_ARGS+=(--kv_f16 none)
 # Pass the resolved backend down explicitly: ggml_demo's own default is
 # Vulkan0, which would mismatch a CUDA build directory chosen here.
-exec "$PYTHON_BIN" "$ROOT/ggml_demo.py" --model "$MODEL" --build "$BUILD" --backend "$BACKEND" "${ARGS[@]}"
+exec "$PYTHON_BIN" "$ROOT/ggml_demo.py" --model "$MODEL" --build "$BUILD" --backend "$BACKEND" "${EXTRA_ARGS[@]}" "${ARGS[@]}"

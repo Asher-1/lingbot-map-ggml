@@ -1,0 +1,7 @@
+cloud_a,cloud_b,nn_rmse
+pt_long_fp32,pt_bal_fp32,6.861058965976118
+pt_long_fp32,ggml_long_f16_flash_cuda,4.117277842134728
+pt_long_fp32,ggml_bal_f16_flash_cuda,7.084175618681048
+pt_bal_fp32,ggml_long_f16_flash_cuda,5.885081316551379
+pt_bal_fp32,ggml_bal_f16_flash_cuda,2.150278840422705
+ggml_long_f16_flash_cuda,ggml_bal_f16_flash_cuda,5.399921342689332

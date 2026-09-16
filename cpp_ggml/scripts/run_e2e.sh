@@ -21,7 +21,7 @@ TAG="${VARIANT:+${VARIANT}_}"
 case "$BACKEND" in
   cuda) BUILD="$ROOT/cpp_ggml/build-cuda"; DEVICE=CUDA0; CMAKE_ARGS=(-DLINGBOT_GGML_CUDA=ON -DLINGBOT_GGML_CUDA_ARCHITECTURES=86-real -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc) ;;
   vulkan) BUILD="$ROOT/cpp_ggml/build-vulkan"; DEVICE=Vulkan0; CMAKE_ARGS=(-DLINGBOT_GGML_VULKAN=ON) ;;
-  *) echo "usage: $0 {cuda|vulkan} {q8|f16} [frames] [variant]" >&2; exit 2 ;;
+  *) echo "usage: $0 {cuda|vulkan} {q8|f16|f32} [frames] [variant]" >&2; exit 2 ;;
 esac
 
 MODEL="$ROOT/cpp_ggml/models/gguf/lingbot-map-${VARIANT:+${VARIANT}-}${DTYPE}.gguf"
@@ -52,13 +52,16 @@ cmake --build "$BUILD" --parallel 6
 
 # run_reconstruction.py now derives the height from the official crop rule
 # (aspect-preserving, snapped to the patch grid), so we do not pass --height.
-# It also runs the persistent F16 KV cache by default (LINGBOT_KV_CACHE_F16=1),
-# matching the upstream scale=8/window=64 profile.
+# The cache profile is passed explicitly: the shipped streaming profile is
+# scale=8/window=64 (the persistent F16 KV cache default matches the upstream
+# profile) — the script's own run_reconstruction defaults are the bounded
+# 12-GiB release profile (scale=1/window=4), which is NOT this gate's target.
 python3_in_use="$PYTHON"
 "$python3_in_use" "$ROOT/cpp_ggml/scripts/run_reconstruction.py" \
   --build "$BUILD" --backend "$DEVICE" --model "$MODEL" --reference-gguf "$MODEL" \
   --scene "$SCENE" --frames "$FRAMES" --out "$OUT" --effect-out "$EFFECT" \
-  --full-export-prefix "$EXPORT" --pose-tol 0.001 --depth-tol 0.003
+  --full-export-prefix "$EXPORT" --pose-tol 0.001 --depth-tol 0.003 \
+  --kv-cache-scale 8 --kv-cache-window 64
 
 # The elementwise gate reads the same LBO the run just wrote; the native
 # courtyard aspect is 294x518 (width x height), which is the identity output of
